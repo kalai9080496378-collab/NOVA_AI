@@ -210,3 +210,66 @@ def test_end_to_end_voice_query_through_nova_assistant():
     assert tts_result["success"] is True
     assert tts_result["audio_bytes"] is not None
     assert len(tts_result["audio_bytes"]) > 500
+
+
+# -----------------------------------------------------------------------------
+# 5. Language Selection, Tamil, Tanglish & Multimodal STT Tests
+# -----------------------------------------------------------------------------
+
+def test_resolve_language_tag():
+    from modules.voice_assistant import resolve_language_tag
+    assert resolve_language_tag("ta") == "ta-IN"
+    assert resolve_language_tag("ta-in") == "ta-IN"
+    assert resolve_language_tag("tamil") == "ta-IN"
+    assert resolve_language_tag("en") == "en-IN"
+    assert resolve_language_tag("en-in") == "en-IN"
+    assert resolve_language_tag("en-us") == "en-US"
+    assert resolve_language_tag("tanglish") == "en-IN"
+    assert resolve_language_tag(None) == "en-IN"
+
+
+def test_transcribe_audio_tamil_language_passed_to_recognizer():
+    wav_bytes = _generate_synthetic_wav_bytes(1.0)
+    with patch("speech_recognition.Recognizer.recognize_google", return_value="இன்றைய பணிகள் என்ன") as mock_rec:
+        res = transcribe_audio(wav_bytes, language="ta-IN", consent_external=True)
+        assert res["success"] is True
+        assert res["text"] == "இன்றைய பணிகள் என்ன"
+        assert res["language"] == "ta-IN"
+        mock_rec.assert_called_once()
+        _, kwargs = mock_rec.call_args
+        assert kwargs.get("language") == "ta-IN"
+
+
+def test_transcribe_audio_indian_english_default():
+    wav_bytes = _generate_synthetic_wav_bytes(1.0)
+    with patch("speech_recognition.Recognizer.recognize_google", return_value="add task complete research") as mock_rec:
+        res = transcribe_audio(wav_bytes, consent_external=True)
+        assert res["success"] is True
+        assert res["language"] == "en-IN"
+        _, kwargs = mock_rec.call_args
+        assert kwargs.get("language") == "en-IN"
+
+
+def test_transcribe_audio_gemini_multimodal_mock():
+    wav_bytes = _generate_synthetic_wav_bytes(1.0)
+    with patch("modules.voice_assistant._transcribe_with_gemini") as mock_gemini:
+        mock_gemini.return_value = {
+            "success": True,
+            "text": "NOVA innaiku enna task irukku",
+            "engine_used": "Google Gemini 1.5 Flash (Multimodal Audio)",
+            "error": None,
+            "error_type": None,
+        }
+        res = transcribe_audio(wav_bytes, engine="gemini", language="tanglish", consent_external=True)
+        assert res["success"] is True
+        assert "innaiku" in res["text"]
+        assert "Gemini" in res["engine_used"]
+
+
+def test_synthesize_speech_tamil_auto_detection():
+    # Test that Tamil Unicode text automatically triggers 'ta' language synthesis
+    res = synthesize_speech("வணக்கம்! இன்றைய பணிகள் மூன்று உள்ளன.")
+    assert res["success"] is True
+    assert res["language_used"] == "ta"
+    assert "Tamil" in res["engine_used"]
+    assert res["audio_bytes"] is not None

@@ -78,8 +78,47 @@ def init_db(db_path: Optional[Path | str] = None) -> bool:
                     if "completed_at" not in columns:
                         cursor.execute("ALTER TABLE tasks ADD COLUMN completed_at TEXT")
 
+                # Check if conversations table exists to add metadata column if missing
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'")
+                if cursor.fetchone():
+                    cursor.execute("PRAGMA table_info(conversations)")
+                    c_cols = [row["name"] for row in cursor.fetchall()]
+                    if "metadata" not in c_cols:
+                        cursor.execute("ALTER TABLE conversations ADD COLUMN metadata TEXT")
+
                 # Execute schema SQL (creates tables and indexes if not exists)
                 conn.executescript(schema_sql)
+
+                # Backfill chat_threads from existing conversation history if empty
+                cursor.execute("SELECT count(*) as c FROM chat_threads")
+                if cursor.fetchone()["c"] == 0:
+                    cursor.execute("""
+                        INSERT OR IGNORE INTO chat_threads (id, title, created_at, updated_at)
+                        SELECT 
+                            conversation_id as id,
+                            COALESCE(
+                                SUBSTR(MIN(CASE WHEN role='user' THEN message END), 1, 40),
+                                'Conversation ' || SUBSTR(conversation_id, 1, 8)
+                            ) as title,
+                            MIN(created_at) as created_at,
+                            MAX(created_at) as updated_at
+                        FROM conversations
+                        GROUP BY conversation_id;
+                    """)
+
+                # Seed baseline model in model_registry if empty
+                cursor.execute("SELECT count(*) as c FROM model_registry")
+                if cursor.fetchone()["c"] == 0:
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    cursor.execute("""
+                        INSERT OR IGNORE INTO model_registry (
+                            id, version_tag, provider, base_model, status, is_fine_tuned, eval_score, eval_details, training_cost_usd, created_at, updated_at
+                        ) VALUES (
+                            'model_v1_base', 'v1.0.0-base', 'gemini', 'gemini-1.5-flash', 'active', 0, 85.0,
+                            '{"accuracy": 85.0, "instruction_following": 88.0, "format_compliance": 92.0, "safety": 99.0}',
+                            0.0, ?, ?
+                        )
+                    """, (now_iso, now_iso))
 
             return True
         finally:

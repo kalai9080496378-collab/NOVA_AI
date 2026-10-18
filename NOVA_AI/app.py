@@ -7,6 +7,9 @@ Phase 1 MVP: Streamlit User Interface & Core Feature System
 """
 
 import os
+import re
+import json
+import io
 import hashlib
 from datetime import datetime, date
 from pathlib import Path
@@ -14,7 +17,7 @@ import streamlit as st
 import pandas as pd
 
 # Core NOVA Imports
-from database.db import init_db, DATABASE_PATH, log_action
+from database.db import init_db, DATABASE_PATH, log_action, fetch_all, fetch_one
 from nova_core.config import (
     APP_NAME,
     APP_TAGLINE,
@@ -24,6 +27,38 @@ from nova_core.config import (
     get_voice_status,
 )
 from nova_core.assistant import NovaAssistant
+from nova_core.conversation_manager import (
+    create_thread,
+    get_thread,
+    get_all_threads,
+    update_thread,
+    delete_thread,
+    add_message,
+    get_thread_messages,
+    auto_generate_title,
+    group_threads_by_date,
+    export_thread_markdown,
+    export_thread_json,
+)
+from nova_core.learning_system import (
+    record_message_feedback,
+    get_feedback_summary,
+    record_correction,
+    get_learning_examples,
+    retrieve_relevant_corrections,
+    get_learning_system_metrics,
+    delete_correction,
+    export_memories_json,
+    export_memories_csv,
+)
+from nova_core.fine_tuning_pipeline import (
+    inspect_fine_tuning_support,
+    scrub_pii_and_secrets,
+    build_training_dataset,
+    estimate_training_compute_and_cost,
+    evaluate_model_performance,
+    rollback_model_version,
+)
 from tools.task_manager import (
     create_task,
     get_tasks,
@@ -92,6 +127,9 @@ from modules.voice_assistant import (
     transcribe_audio,
     synthesize_speech,
     get_voice_capabilities,
+    SUPPORTED_LANGUAGES,
+    calculate_pcm_rms,
+    resolve_language_tag,
 )
 
 # -----------------------------------------------------------------------------
@@ -213,31 +251,21 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 # -----------------------------------------------------------------------------
 # 2. Session State Initialization
 # -----------------------------------------------------------------------------
-if "conversation_id" not in st.session_state:
-    st.session_state.conversation_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+if "active_thread_id" not in st.session_state:
+    existing_threads = get_all_threads(include_archived=False)
+    if existing_threads:
+        st.session_state.active_thread_id = existing_threads[0]["id"]
+    else:
+        new_th = create_thread(title="New Conversation")
+        st.session_state.active_thread_id = new_th["id"]
+
+st.session_state.conversation_id = st.session_state.active_thread_id
 
 if "chat_messages" not in st.session_state:
-    # Load past turns from SQLite for this session, or initialize with welcome
-    assistant = NovaAssistant()
-    history = assistant.get_conversation_history(st.session_state.conversation_id)
-    if history:
-        st.session_state.chat_messages = [{"role": h["role"], "content": h["message"]} for h in history]
-    else:
-        st.session_state.chat_messages = [
-            {
-                "role": "assistant",
-                "content": (
-                    f"👋 Welcome to **{APP_NAME}**! ({APP_TAGLINE})\n\n"
-                    f"I'm your personal AI assistant. In this Phase 1 foundation, I operate in "
-                    f"**Rule-Based Mode** with persistent SQLite memory, task management, and productivity tracking.\n\n"
-                    f"**Quick things you can try:**\n"
-                    f"- `add task: Complete ML project due 2026-10-31 priority High`\n"
-                    f"- `show tasks` or `stats`\n"
-                    f"- `remember: [Academic] Thesis topic is Graph Neural Networks`\n"
-                    f"- `help` for command syntax."
-                )
-            }
-        ]
+    st.session_state.chat_messages = get_thread_messages(st.session_state.active_thread_id)
+
+if "pending_prompt" not in st.session_state:
+    st.session_state.pending_prompt = None
 
 if "voice_consent" not in st.session_state:
     st.session_state.voice_consent = True
@@ -256,6 +284,29 @@ if "voice_messages" not in st.session_state:
 
 if "last_voice_page_audio_hash" not in st.session_state:
     st.session_state.last_voice_page_audio_hash = None
+
+# Staged Voice Transcription State (Allows user review & edit before sending to AI)
+if "chat_staged_transcript" not in st.session_state:
+    st.session_state.chat_staged_transcript = None
+if "chat_staged_audio_hash" not in st.session_state:
+    st.session_state.chat_staged_audio_hash = None
+if "chat_staged_audio_bytes" not in st.session_state:
+    st.session_state.chat_staged_audio_bytes = None
+if "chat_staged_meta" not in st.session_state:
+    st.session_state.chat_staged_meta = None
+if "chat_processed_audio_hash" not in st.session_state:
+    st.session_state.chat_processed_audio_hash = None
+
+if "voice_page_staged_transcript" not in st.session_state:
+    st.session_state.voice_page_staged_transcript = None
+if "voice_page_staged_audio_hash" not in st.session_state:
+    st.session_state.voice_page_staged_audio_hash = None
+if "voice_page_staged_audio_bytes" not in st.session_state:
+    st.session_state.voice_page_staged_audio_bytes = None
+if "voice_page_staged_meta" not in st.session_state:
+    st.session_state.voice_page_staged_meta = None
+if "voice_page_processed_audio_hash" not in st.session_state:
+    st.session_state.voice_page_processed_audio_hash = None
 
 
 # -----------------------------------------------------------------------------
@@ -295,6 +346,7 @@ with st.sidebar:
         "🧠 My Memory",
         "🎓 Student Mode",
         "📄 Document Assistant",
+        "🧠 Self-Learning & Training",
         "⚙️ Settings",
     ]
 
@@ -304,6 +356,99 @@ with st.sidebar:
         index=0,
         label_visibility="collapsed",
     )
+
+    if selected_page == "💬 AI Chat":
+        st.markdown("---")
+        st.markdown("#### 💬 Conversations")
+
+        # + New Chat Button
+        if st.button("➕ New Chat", use_container_width=True, type="primary", key="sb_new_chat_btn"):
+            new_th = create_thread(title="New Conversation")
+            st.session_state.active_thread_id = new_th["id"]
+            st.session_state.conversation_id = new_th["id"]
+            st.session_state.pending_prompt = None
+            st.rerun()
+
+        # Search conversations
+        chat_search = st.text_input("Search chats", placeholder="🔍 Filter chats...", label_visibility="collapsed", key="sb_search_chats")
+
+        # Load active and archived threads
+        active_threads = get_all_threads(include_archived=False, search_query=chat_search)
+        archived_threads = get_all_threads(include_archived=True, search_query=chat_search)
+        archived_only = [t for t in archived_threads if t.get("is_archived")]
+
+        grouped = group_threads_by_date(active_threads)
+
+        if not active_threads:
+            st.caption("No conversations found.")
+        else:
+            for grp_name, th_list in grouped.items():
+                st.markdown(
+                    f"<div style='font-size: 0.72rem; font-weight: 700; color: #64748b; margin-top: 10px; margin-bottom: 4px; text-transform: uppercase;'>{grp_name}</div>",
+                    unsafe_allow_html=True,
+                )
+                for th in th_list:
+                    is_active = (th["id"] == st.session_state.active_thread_id)
+                    col_btn, col_pop = st.columns([5, 1])
+                    with col_btn:
+                        prefix = "🔹 " if is_active else ""
+                        btn_name = f"{prefix}{th['title']}"
+                        if st.button(
+                            btn_name,
+                            key=f"sb_th_{th['id']}",
+                            use_container_width=True,
+                            help=f"Thread: {th['title']}",
+                        ):
+                            st.session_state.active_thread_id = th["id"]
+                            st.session_state.conversation_id = th["id"]
+                            st.session_state.pending_prompt = None
+                            st.rerun()
+                    with col_pop:
+                        with st.popover("⋮", help="Options"):
+                            st.caption(f"**{th['title']}**")
+                            with st.form(f"sb_rename_{th['id']}"):
+                                new_t = st.text_input("Rename", value=th["title"])
+                                if st.form_submit_button("Save"):
+                                    if new_t.strip():
+                                        update_thread(th["id"], title=new_t.strip())
+                                        st.rerun()
+
+                            pin_txt = "Unpin" if th.get("is_pinned") else "📌 Pin"
+                            if st.button(pin_txt, key=f"sb_pin_{th['id']}", use_container_width=True):
+                                update_thread(th["id"], is_pinned=not th.get("is_pinned"))
+                                st.rerun()
+
+                            if st.button("📦 Archive", key=f"sb_arch_{th['id']}", use_container_width=True):
+                                update_thread(th["id"], is_archived=True)
+                                if st.session_state.active_thread_id == th["id"]:
+                                    rem = [t for t in active_threads if t["id"] != th["id"]]
+                                    st.session_state.active_thread_id = rem[0]["id"] if rem else create_thread()["id"]
+                                    st.session_state.conversation_id = st.session_state.active_thread_id
+                                st.rerun()
+
+                            if st.button("🗑️ Delete", key=f"sb_del_{th['id']}", use_container_width=True):
+                                delete_thread(th["id"])
+                                if st.session_state.active_thread_id == th["id"]:
+                                    rem = [t for t in active_threads if t["id"] != th["id"]]
+                                    st.session_state.active_thread_id = rem[0]["id"] if rem else create_thread()["id"]
+                                    st.session_state.conversation_id = st.session_state.active_thread_id
+                                st.rerun()
+
+        if archived_only:
+            with st.expander(f"📦 Archived ({len(archived_only)})", expanded=False):
+                for ath in archived_only:
+                    st.caption(f"📁 **{ath['title']}**")
+                    c_un, c_del = st.columns(2)
+                    with c_un:
+                        if st.button("Restore", key=f"unarch_{ath['id']}", use_container_width=True):
+                            update_thread(ath["id"], is_archived=False)
+                            st.session_state.active_thread_id = ath["id"]
+                            st.session_state.conversation_id = ath["id"]
+                            st.rerun()
+                    with c_del:
+                        if st.button("Delete", key=f"del_arch_{ath['id']}", use_container_width=True):
+                            delete_thread(ath["id"])
+                            st.rerun()
 
     st.markdown("---")
     st.markdown(
@@ -484,17 +629,92 @@ if selected_page == "🏠 Home":
 # PAGE 2: AI CHAT
 # -----------------------------------------------------------------------------
 elif selected_page == "💬 AI Chat":
-    st.markdown(
-        """
-        <div class="nova-card">
-            <h2 style="margin: 0; color: #f8fafc;">NOVA AI Chat</h2>
-            <p style="margin: 4px 0 0 0; color: #94a3b8; font-size: 0.9rem;">
-                Execute tasks, save memories, inspect productivity, or explore commands via natural language.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    # 1. Resolve Active Conversation Thread
+    active_th = get_thread(st.session_state.active_thread_id)
+    if not active_th:
+        existing = get_all_threads(include_archived=False)
+        if existing:
+            st.session_state.active_thread_id = existing[0]["id"]
+            active_th = existing[0]
+        else:
+            active_th = create_thread(title="New Conversation")
+            st.session_state.active_thread_id = active_th["id"]
+
+    st.session_state.conversation_id = st.session_state.active_thread_id
+
+    # 2. Modern Conversation Header with inline management & export
+    th_c1, th_c2, th_c3 = st.columns([5, 1, 1])
+    with th_c1:
+        pin_badge = "📌 " if active_th.get("is_pinned") else ""
+        st.markdown(
+            f"""
+            <div style="margin-bottom: 4px;">
+                <h2 style="margin: 0; color: #f8fafc; font-size: 1.6rem;">{pin_badge}{active_th['title']}</h2>
+                <div style="font-size: 0.8rem; color: #94a3b8; margin-top: 3px;">
+                    Model: <code>{active_th.get('model', 'gemini-1.5-flash')}</code> &bull; 
+                    Created: {active_th['created_at'][:10]} &bull; 
+                    Session ID: <code>{active_th['id']}</code>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with th_c2:
+        with st.popover("⚙️ Thread", help="Manage this conversation"):
+            st.caption(f"**Settings for #{active_th['id']}**")
+            with st.form("main_th_rename"):
+                renamed = st.text_input("Title", value=active_th["title"])
+                if st.form_submit_button("✏️ Rename"):
+                    if renamed.strip():
+                        update_thread(active_th["id"], title=renamed.strip())
+                        st.rerun()
+
+            p_label = "Unpin" if active_th.get("is_pinned") else "📌 Pin to top"
+            if st.button(p_label, use_container_width=True, key="hdr_pin_btn"):
+                update_thread(active_th["id"], is_pinned=not active_th.get("is_pinned"))
+                st.rerun()
+
+            if st.button("➕ New Chat", use_container_width=True, key="hdr_new_btn"):
+                nth = create_thread(title="New Conversation")
+                st.session_state.active_thread_id = nth["id"]
+                st.session_state.conversation_id = nth["id"]
+                st.session_state.pending_prompt = None
+                st.rerun()
+
+            if st.button("📦 Archive", use_container_width=True, key="hdr_arch_btn"):
+                update_thread(active_th["id"], is_archived=True)
+                rem = get_all_threads(include_archived=False)
+                st.session_state.active_thread_id = rem[0]["id"] if rem else create_thread()["id"]
+                st.session_state.conversation_id = st.session_state.active_thread_id
+                st.rerun()
+
+            if st.button("🗑️ Delete Thread", type="secondary", use_container_width=True, key="hdr_del_btn"):
+                delete_thread(active_th["id"])
+                rem = get_all_threads(include_archived=False)
+                st.session_state.active_thread_id = rem[0]["id"] if rem else create_thread()["id"]
+                st.session_state.conversation_id = st.session_state.active_thread_id
+                st.rerun()
+
+    with th_c3:
+        with st.popover("📥 Export", help="Export this chat"):
+            st.caption("**Export Options**")
+            md_content = export_thread_markdown(active_th["id"])
+            json_content = export_thread_json(active_th["id"])
+            safe_slug = re.sub(r"[^a-zA-Z0-9_\-]+", "_", active_th["title"]).lower()
+            st.download_button(
+                "📄 Markdown (.md)",
+                data=md_content,
+                file_name=f"nova_{safe_slug}.md",
+                mime="text/markdown",
+                use_container_width=True,
+            )
+            st.download_button(
+                "💾 JSON (.json)",
+                data=json_content,
+                file_name=f"nova_{safe_slug}.json",
+                mime="application/json",
+                use_container_width=True,
+            )
 
     # Mode notification
     llm_info = get_llm_status()
@@ -511,43 +731,129 @@ elif selected_page == "💬 AI Chat":
             "*(To enable AI reasoning, add your free GEMINI_API_KEY in `.env`)*"
         )
 
-    # Conversation Action Controls
-    top_col1, top_col2 = st.columns([5, 1])
-    with top_col2:
-        if st.button("🔄 Clear Chat", use_container_width=True):
-            st.session_state.chat_messages = []
-            st.session_state.conversation_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            st.rerun()
+    # 3. Load Thread Messages from SQLite
+    thread_messages = get_thread_messages(active_th["id"])
 
-    # Display chat conversation
-    for idx, msg in enumerate(st.session_state.chat_messages):
-        with st.chat_message(msg["role"]):
-            if msg.get("source") == "voice":
-                st.caption("🎙️ Spoken Input")
-            if msg["role"] == "assistant":
-                if msg.get("tool_called"):
-                    st.caption(f"🔧 Tool Invoked: `{msg['tool_called']}` (Validated & Executed)")
-                elif msg.get("mode") == "llm":
-                    st.caption(f"⚡ Generated by {msg.get('provider', '').upper()} (`{msg.get('model', '')}`)")
-                elif msg.get("mode") == "fallback_rule_based":
-                    st.caption("⚠️ Rule-Based Fallback Engaged")
-            st.markdown(msg["content"])
-            if msg.get("audio_bytes"):
-                st.caption("🔊 Spoken Voice Response")
-                st.audio(
-                    msg["audio_bytes"],
-                    format="audio/mp3",
-                    autoplay=(st.session_state.get("voice_autoplay", False) and (idx == len(st.session_state.chat_messages) - 1)),
-                )
+    # Empty State: ChatGPT-style welcome cards
+    if not thread_messages:
+        st.markdown(
+            """
+            <div style="text-align: center; padding: 40px 16px 20px 16px;">
+                <div style="font-size: 3rem; margin-bottom: 6px;">🌌</div>
+                <h2 style="color: #f8fafc; margin-bottom: 6px; font-weight: 700;">How can NOVA help you today?</h2>
+                <p style="color: #94a3b8; font-size: 0.95rem; max-width: 600px; margin: 0 auto 24px auto;">
+                    Explore machine learning, organize academic priorities, store persistent knowledge, or run natural commands.
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-    # Voice Intelligence Panel (Microphone Button & Spoken Q&A)
+        s_col1, s_col2 = st.columns(2)
+        with s_col1:
+            if st.button("💡 **Explain Machine Learning Concepts**\n\n*Understand gradient descent & loss functions*", use_container_width=True):
+                st.session_state.pending_prompt = "Explain gradient descent, learning rates, and loss minimization in machine learning."
+                st.rerun()
+            if st.button("🧠 **Save Academic Memory**\n\n*Store thesis research topic in memory*", use_container_width=True):
+                st.session_state.pending_prompt = "remember: [Academic] My MSc thesis topic is Graph Neural Networks for Drug Discovery."
+                st.rerun()
+        with s_col2:
+            if st.button("📋 **Create Project Task**\n\n*Schedule assignment deadline with high priority*", use_container_width=True):
+                st.session_state.pending_prompt = "add task: Complete Deep Learning Assignment due 2026-11-15 priority High"
+                st.rerun()
+            if st.button("📊 **Productivity Status**\n\n*Inspect task completion & metrics*", use_container_width=True):
+                st.session_state.pending_prompt = "stats"
+                st.rerun()
+    else:
+        # Display conversation messages
+        for idx, msg in enumerate(thread_messages):
+            with st.chat_message(msg["role"]):
+                if msg["role"] == "user":
+                    st.markdown(msg["content"])
+                else:
+                    meta = msg.get("metadata", {})
+                    if meta.get("tool_called"):
+                        st.caption(f"🔧 Tool Invoked: `{meta['tool_called']}` (Validated & Executed)")
+                    elif meta.get("mode") == "llm":
+                        st.caption(f"⚡ Generated by {meta.get('provider', '').upper()} (`{meta.get('model', '')}`)")
+                    elif meta.get("mode") == "fallback_rule_based":
+                        st.caption("⚠️ Rule-Based Fallback Engaged")
+
+                    st.markdown(msg["content"])
+
+                    # Turn Actions: Copy, Thumbs Up, Thumbs Down, Teach NOVA, and Retry
+                    act_c1, act_c2, act_c3, act_c4, act_c5 = st.columns([1.1, 0.7, 0.7, 1.3, 1.4])
+                    with act_c1:
+                        with st.popover("📋 Copy", help="Copy response content"):
+                            st.code(msg["content"], language="markdown")
+                    with act_c2:
+                        if st.button("👍", key=f"fb_up_{msg['id']}", help="Mark response as helpful"):
+                            record_message_feedback(
+                                conversation_id=active_th["id"],
+                                rating="thumbs_up",
+                                message_id=msg["id"],
+                                is_approved_for_training=True,
+                            )
+                            st.toast("Feedback recorded: Helpful! 👍")
+                    with act_c3:
+                        if st.button("👎", key=f"fb_down_{msg['id']}", help="Mark response as unhelpful or incorrect"):
+                            record_message_feedback(
+                                conversation_id=active_th["id"],
+                                rating="thumbs_down",
+                                message_id=msg["id"],
+                                is_approved_for_training=True,
+                            )
+                            st.toast("Feedback recorded: Needs improvement. Click ✏️ Teach to submit a verified correction.")
+                    with act_c4:
+                        with st.popover("✏️ Teach", help="Submit a verified correction to teach NOVA"):
+                            st.caption("**Teach NOVA / Submit Verified Correction**")
+                            corr_prev_usr = next((m["content"] for m in reversed(thread_messages[:idx]) if m["role"] == "user"), "")
+                            with st.form(f"corr_form_{msg['id']}"):
+                                c_prompt = st.text_input("User Question / Prompt", value=corr_prev_usr)
+                                c_bad = st.text_area("NOVA's Current (Incorrect) Answer", value=msg["content"][:300], height=68)
+                                c_good = st.text_area("Verified / Desired Answer", placeholder="Enter the accurate, desired response...", height=90)
+                                c_expl = st.text_input("Explanation / Rationale (Optional)", placeholder="e.g. In Python 3.10+, match-case was added")
+                                c_cat = st.selectbox("Category", ["Correction", "Demonstration", "Academic", "Code", "Identity", "Preferences"], index=0)
+                                c_consent = st.checkbox("Approve this correction for NOVA's self-learning store", value=True)
+                                if st.form_submit_button("💾 Save Correction", type="primary"):
+                                    if not c_prompt.strip() or not c_good.strip():
+                                        st.error("Prompt and verified answer cannot be empty.")
+                                    else:
+                                        record_correction(
+                                            user_prompt=c_prompt,
+                                            corrected_response=c_good,
+                                            rejected_response=c_bad,
+                                            explanation=c_expl,
+                                            category=c_cat,
+                                            is_approved=c_consent,
+                                            source="user_correction",
+                                        )
+                                        record_message_feedback(
+                                            conversation_id=active_th["id"],
+                                            rating="thumbs_down",
+                                            message_id=msg["id"],
+                                            feedback_text=f"Corrected: {c_good[:100]}",
+                                            is_approved_for_training=c_consent,
+                                        )
+                                        st.toast("✅ Correction saved! NOVA will retrieve this approved knowledge in future queries.")
+                                        st.rerun()
+                    with act_c5:
+                        # Offer retry on the last assistant response
+                        if idx == len(thread_messages) - 1:
+                            prev_usr = next((m["content"] for m in reversed(thread_messages[:idx]) if m["role"] == "user"), None)
+                            if prev_usr:
+                                if st.button("🔄 Retry", key=f"retry_{msg['id']}", help="Regenerate this turn"):
+                                    st.session_state.pending_prompt = prev_usr
+                                    st.rerun()
+
+    # 4. Voice Intelligence Panel (Preserving Phase 4 Voice Features & Language Control)
     with st.expander("🎙️ Voice Intelligence & Microphone (Click to Speak)", expanded=False):
         v_col1, v_col2, v_col3 = st.columns([2, 1, 1])
         with v_col1:
             st.markdown(
                 """
                 <div style="font-size: 0.82rem; color: #94a3b8; line-height: 1.4;">
-                    <b>🎙️ Voice Privacy & Security:</b> Recording is user-initiated. Audio snippets are sent over encrypted HTTPS to Google Web Speech API for transcription and discarded immediately. Zero cost ($0.00).
+                    <b>🎙️ Voice Privacy & Security:</b> Voice input is strictly user-initiated. Audio snippets are sent over encrypted HTTPS for transcription and discarded immediately after processing. Zero continuous recording.
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -571,105 +877,227 @@ elif selected_page == "💬 AI Chat":
                 key="chat_autoplay_checkbox",
             )
 
+        st.markdown("<hr style='margin: 8px 0; border-color: rgba(255,255,255,0.08);'>", unsafe_allow_html=True)
+
+        # Language and STT Engine Controls
+        cfg_col1, cfg_col2 = st.columns(2)
+        with cfg_col1:
+            chat_lang_label = st.selectbox(
+                "🗣️ Speech Language",
+                options=[
+                    "English (India) [en-IN] — Recommended for Indian Accents",
+                    "Tamil / தமிழ் [ta-IN] — Native Tamil Speech",
+                    "Tanglish (Tamil + English Mixed)",
+                    "English (US) [en-US] — Standard American English",
+                ],
+                index=0,
+                key="chat_voice_language_select",
+                help="Select your spoken dialect. en-IN is calibrated for Indian English rhythm, cadence, and pronunciations.",
+            )
+            lang_map = {
+                "English (India) [en-IN] — Recommended for Indian Accents": "en-IN",
+                "Tamil / தமிழ் [ta-IN] — Native Tamil Speech": "ta-IN",
+                "Tanglish (Tamil + English Mixed)": "tanglish",
+                "English (US) [en-US] — Standard American English": "en-US",
+            }
+            selected_lang_code = lang_map.get(chat_lang_label, "en-IN")
+
+        with cfg_col2:
+            chat_engine_label = st.selectbox(
+                "⚙️ Recognition Engine",
+                options=[
+                    "Auto (Gemini 1.5 Flash if available, else Google Web Speech)",
+                    "Google Web Speech (Free $0.00, Zero API Key Required)",
+                    "Google Gemini 1.5 Flash (Multimodal Audio, Best for Tanglish)",
+                ],
+                index=0,
+                key="chat_voice_engine_select",
+                help="Auto seamlessly uses Gemini 1.5 Flash when GEMINI_API_KEY is present in your .env file, and falls back to Google Web Speech.",
+            )
+            engine_map = {
+                "Auto (Gemini 1.5 Flash if available, else Google Web Speech)": "auto",
+                "Google Web Speech (Free $0.00, Zero API Key Required)": "google",
+                "Google Gemini 1.5 Flash (Multimodal Audio, Best for Tanglish)": "gemini",
+            }
+            selected_engine = engine_map.get(chat_engine_label, "auto")
+
         st.write("")
         st.write("**Click the microphone icon below to speak to NOVA:**")
-        mic_audio = st.audio_input("Record voice message", key="chat_microphone_widget")
+        mic_audio = st.audio_input(
+            "Record voice message (Click mic to Start, Click again to Stop)",
+            key="chat_microphone_widget",
+        )
 
         if mic_audio is not None:
             raw_audio_bytes = mic_audio.getvalue()
             audio_md5 = hashlib.md5(raw_audio_bytes).hexdigest()
 
-            # Prevent duplicate processing of the same recording on page reruns
-            if st.session_state.get("last_processed_audio_hash") != audio_md5:
-                st.session_state.last_processed_audio_hash = audio_md5
-
+            # Check if this is new un-staged and un-processed audio
+            if (
+                st.session_state.get("chat_staged_audio_hash") != audio_md5
+                and st.session_state.get("chat_processed_audio_hash") != audio_md5
+            ):
                 if not chat_consent:
-                    st.warning("⚠️ External audio processing consent is required to use Google Web Speech. Please check the consent box above.")
+                    st.warning("⚠️ External audio processing consent is required for transcription. Please check the consent box above.")
                 elif len(raw_audio_bytes) < 200:
                     st.warning("⚠️ Recording empty or too short. Please speak clearly into your microphone.")
                 else:
-                    with st.spinner("🎧 Transcribing your voice..."):
+                    with st.spinner(f"🎧 Transcribing your speech ({selected_lang_code})..."):
                         stt_result = transcribe_audio(
                             raw_audio_bytes,
                             audio_format="wav",
-                            engine="google",
+                            language=selected_lang_code,
+                            engine=selected_engine,
                             consent_external=chat_consent,
                         )
 
                     if not stt_result["success"]:
-                        st.error(f"❌ Speech Recognition Error: {stt_result['error']}")
+                        st.error(f"❌ Speech Recognition Notice: {stt_result['error']}")
+                        if stt_result.get("error_type") in ("silence", "unknown_audio"):
+                            st.info(
+                                "💡 **Microphone Troubleshooting Tips:**\n"
+                                "- Check your browser's microphone permissions (lock/site settings icon in the address bar).\n"
+                                "- Check that your physical microphone is selected as default and unmuted in Windows Sound Settings.\n"
+                                "- Ensure your mic input volume is above 60% and speak closer to the microphone.\n"
+                                "- If speaking Tanglish, ensure the language dropdown is set to 'Tanglish' or 'English (India)'."
+                            )
                     else:
-                        transcribed_prompt = stt_result["text"]
-                        st.success(f"🗣️ Transcribed: \"{transcribed_prompt}\"")
+                        # Stage transcript for user review & editing before committing to the AI
+                        st.session_state.chat_staged_audio_hash = audio_md5
+                        st.session_state.chat_staged_audio_bytes = raw_audio_bytes
+                        st.session_state.chat_staged_transcript = stt_result["text"]
+                        st.session_state.chat_staged_meta = stt_result
+                        st.rerun()
 
-                        # Append user message
-                        st.session_state.chat_messages.append({
-                            "role": "user",
-                            "content": transcribed_prompt,
-                            "source": "voice",
-                        })
+        # Staged Review and Edit Card
+        if st.session_state.get("chat_staged_transcript") is not None:
+            st.markdown("<hr style='margin: 12px 0; border-color: rgba(6, 182, 212, 0.3);'>", unsafe_allow_html=True)
+            st.markdown("#### 📝 Review & Edit Transcript Before Sending")
+            st.caption("Inspect and modify the recognized text below to correct any misheard words or slang before submitting to NOVA.")
 
-                        # Process via Assistant
+            meta = st.session_state.get("chat_staged_meta", {})
+            engine_name = meta.get("engine_used", "speech engine")
+            lang_used = meta.get("language_used", selected_lang_code)
+
+            st.markdown(
+                f"<div style='font-size: 0.82rem; color: #38bdf8; margin-bottom: 8px;'>"
+                f"🟢 <b>Status:</b> Ready for Review &nbsp;|&nbsp; "
+                f"⚙️ <b>Engine:</b> {engine_name} &nbsp;|&nbsp; "
+                f"🗣️ <b>Language:</b> <code>{lang_used}</code>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+            # Audio review playback
+            if st.session_state.get("chat_staged_audio_bytes"):
+                with st.expander("▶️ Listen to your recorded audio snippet", expanded=False):
+                    st.audio(st.session_state.chat_staged_audio_bytes, format="audio/wav")
+
+            # Editable transcript text area
+            edited_transcript = st.text_area(
+                "Recognized Text (Editable):",
+                value=st.session_state.chat_staged_transcript,
+                key="chat_transcript_editor_area",
+                height=90,
+                help="Edit any misheard words or punctuation before submitting to NOVA.",
+            )
+
+            btn_col1, btn_col2, btn_col3 = st.columns([1.6, 1.6, 3])
+            with btn_col1:
+                if st.button("🚀 Send to NOVA", type="primary", key="btn_send_staged_chat"):
+                    clean_prompt = edited_transcript.strip()
+                    if not clean_prompt:
+                        st.warning("⚠️ Message cannot be empty.")
+                    else:
+                        # Prevent re-transcribing same audio buffer
+                        st.session_state.chat_processed_audio_hash = st.session_state.get("chat_staged_audio_hash")
+                        st.session_state.chat_staged_transcript = None
+                        st.session_state.chat_staged_audio_hash = None
+                        st.session_state.chat_staged_audio_bytes = None
+                        st.session_state.chat_staged_meta = None
+
+                        # Process via Assistant into active thread
                         assistant = NovaAssistant()
-                        reply_res = assistant.process_message(
-                            transcribed_prompt,
-                            conversation_id=st.session_state.conversation_id,
-                        )
-                        reply_text = reply_res["response"]
+                        with st.spinner("NOVA is processing your message..."):
+                            reply_res = assistant.process_message(
+                                clean_prompt,
+                                conversation_id=active_th["id"],
+                            )
+                            reply_text = reply_res["response"]
 
-                        # Text-to-Speech synthesis
-                        reply_audio = None
                         if st.session_state.get("voice_tts_enabled", True):
                             with st.spinner("🔊 Synthesizing spoken voice response..."):
                                 tts_res = synthesize_speech(reply_text)
-                                if tts_res["success"]:
-                                    reply_audio = tts_res["audio_bytes"]
+                                if tts_res["success"] and tts_res.get("audio_bytes"):
+                                    st.audio(
+                                        tts_res["audio_bytes"],
+                                        format="audio/mp3",
+                                        autoplay=st.session_state.get("voice_autoplay", False),
+                                    )
 
-                        # Append assistant message
-                        st.session_state.chat_messages.append({
-                            "role": "assistant",
-                            "content": reply_text,
-                            "audio_bytes": reply_audio,
-                            "tool_called": reply_res.get("tool_called"),
-                            "mode": reply_res.get("mode"),
-                            "provider": reply_res.get("provider"),
-                            "model": reply_res.get("model"),
-                        })
-
-                        record_activity("voice_interaction", metadata=f"Spoken: {transcribed_prompt[:40]}")
-                        log_action("voice_interaction", f"Transcribed: '{transcribed_prompt}'", status="success")
+                        record_activity("voice_interaction", metadata=f"Spoken: {clean_prompt[:40]}")
+                        log_action("voice_interaction", f"Transcribed: '{clean_prompt}'", status="success")
                         st.rerun()
 
-    # Chat Input Box for standard text
-    if prompt := st.chat_input("Ask NOVA anything or type a command (e.g., 'add task: ...', 'show tasks', 'help')"):
-        # Append and display user turn
-        st.session_state.chat_messages.append({"role": "user", "content": prompt, "source": "text"})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+            with btn_col2:
+                if st.button("🔄 Discard & Retry", key="btn_discard_staged_chat"):
+                    st.session_state.chat_processed_audio_hash = st.session_state.get("chat_staged_audio_hash")
+                    st.session_state.chat_staged_transcript = None
+                    st.session_state.chat_staged_audio_hash = None
+                    st.session_state.chat_staged_audio_bytes = None
+                    st.session_state.chat_staged_meta = None
+                    st.info("Recording discarded. Click the microphone icon above to speak again.")
+                    st.rerun()
 
-        # Process via NovaAssistant Orchestrator
-        assistant = NovaAssistant()
-        result = assistant.process_message(prompt, conversation_id=st.session_state.conversation_id)
-        response_text = result["response"]
+            with btn_col3:
+                st.caption("Click **Send to NOVA** to query the AI, or **Discard & Retry** to record again.")
+
+        # Microphone Permissions & Troubleshooting Expander
+        with st.expander("❓ Microphone Permission & Audio Troubleshooting Guide", expanded=False):
+            st.markdown(
+                """
+                **How to ensure clear, high-accuracy speech recognition:**
+                1. **Browser Microphone Permission:**
+                   - Look for the lock or site settings icon next to the browser URL (`localhost:8501`).
+                   - Ensure **Microphone** is toggled to **Allow**.
+                2. **Language Accent Matching:**
+                   - For Indian English speakers: Select **`English (India) [en-IN]`** for optimal recognition of Indian pronunciation and cadence.
+                   - For Tamil speakers: Select **`Tamil / தமிழ் [ta-IN]`**.
+                   - For Tamil-English code-switching: Select **`Tanglish`**.
+                3. **Microphone Placement & Noise:**
+                   - Keep the microphone 6–12 inches from your mouth.
+                   - Minimize background noise from ceiling fans, loud ACs, or music.
+                4. **Tanglish Recognition with Gemini:**
+                   - When a `GEMINI_API_KEY` is present in your `.env`, NOVA can leverage Gemini 1.5 Flash's multimodal audio engine for state-of-the-art code-mixed accuracy.
+                """
+            )
+
+    # 5. Chat Input Box with Real-Time Streaming
+    user_prompt = st.chat_input("Ask NOVA anything or enter a command (e.g., 'add task: ...', 'show tasks', 'help')...")
+    if not user_prompt and st.session_state.get("pending_prompt"):
+        user_prompt = st.session_state.pop("pending_prompt")
+
+    if user_prompt:
+        # Display user turn
+        with st.chat_message("user"):
+            st.markdown(user_prompt)
+
+        # Stream assistant response
+        with st.chat_message("assistant"):
+            assistant = NovaAssistant()
+            with st.spinner("NOVA is thinking..."):
+                stream_generator = assistant.process_message_stream(
+                    user_prompt,
+                    conversation_id=active_th["id"],
+                )
+                full_reply = st.write_stream(stream_generator)
 
         # Synthesize speech if voice response is enabled
-        audio_reply_bytes = None
         if st.session_state.get("voice_tts_enabled", False):
-            tts_res = synthesize_speech(response_text)
-            if tts_res["success"]:
-                audio_reply_bytes = tts_res["audio_bytes"]
+            synthesize_speech(full_reply)
 
-        # Append assistant turn
-        st.session_state.chat_messages.append({
-            "role": "assistant",
-            "content": response_text,
-            "audio_bytes": audio_reply_bytes,
-            "tool_called": result.get("tool_called"),
-            "mode": result.get("mode"),
-            "provider": result.get("provider"),
-            "model": result.get("model"),
-        })
         st.rerun()
+
 
 
 # -----------------------------------------------------------------------------
@@ -752,13 +1180,13 @@ elif selected_page == "🎙️ Voice Assistant":
 
     with voice_tab1:
         st.subheader("🗣️ Conversational Voice Dialogue")
-        st.caption("Press Record, speak your question or command, press Stop, and listen to NOVA's spoken answer.")
+        st.caption("Press Record, speak your question or command, press Stop, review/edit your transcript, and listen to NOVA's spoken answer.")
 
         # Consent & Audio Output Configuration
         set_col1, set_col2, set_col3 = st.columns(3)
         with set_col1:
             voice_tab_consent = st.checkbox(
-                "☑️ External STT Consent (Google Web Speech)",
+                "☑️ External STT Consent (Google / Gemini)",
                 value=st.session_state.get("voice_consent", True),
                 key="voice_page_consent_cb",
             )
@@ -776,34 +1204,151 @@ elif selected_page == "🎙️ Voice Assistant":
                 key="voice_page_autoplay_cb",
             )
 
+        st.markdown("<hr style='margin: 8px 0; border-color: rgba(255,255,255,0.08);'>", unsafe_allow_html=True)
+
+        # Language and Recognition Engine Selectors
+        v_col_l, v_col_e = st.columns(2)
+        with v_col_l:
+            v_lang_label = st.selectbox(
+                "🗣️ Spoken Language / Dialect",
+                options=[
+                    "English (India) [en-IN] — Recommended for Indian Accents",
+                    "Tamil / தமிழ் [ta-IN] — Native Tamil Speech",
+                    "Tanglish (Tamil + English Mixed)",
+                    "English (US) [en-US] — Standard American English",
+                ],
+                index=0,
+                key="voice_page_lang_select",
+                help="Calibrate recognition models for your accent. en-IN handles Indian phonetics and syllable timing.",
+            )
+            v_lang_map = {
+                "English (India) [en-IN] — Recommended for Indian Accents": "en-IN",
+                "Tamil / தமிழ் [ta-IN] — Native Tamil Speech": "ta-IN",
+                "Tanglish (Tamil + English Mixed)": "tanglish",
+                "English (US) [en-US] — Standard American English": "en-US",
+            }
+            active_v_lang = v_lang_map.get(v_lang_label, "en-IN")
+
+        with v_col_e:
+            v_engine_label = st.selectbox(
+                "⚙️ Speech Recognition Engine",
+                options=[
+                    "Auto (Gemini 1.5 Flash if available, else Google Web Speech)",
+                    "Google Web Speech (Free $0.00, Zero API Key Required)",
+                    "Google Gemini 1.5 Flash (Multimodal Audio, High Precision)",
+                ],
+                index=0,
+                key="voice_page_engine_select",
+                help="Auto seamlessly uses Gemini 1.5 Flash when GEMINI_API_KEY is configured, else uses Google Web Speech.",
+            )
+            v_engine_map = {
+                "Auto (Gemini 1.5 Flash if available, else Google Web Speech)": "auto",
+                "Google Web Speech (Free $0.00, Zero API Key Required)": "google",
+                "Google Gemini 1.5 Flash (Multimodal Audio, High Precision)": "gemini",
+            }
+            active_v_engine = v_engine_map.get(v_engine_label, "auto")
+
         st.write("")
         st.write("**Record your message below:**")
-        v_audio = st.audio_input("Record your voice command", key="voice_page_recorder")
+        v_audio = st.audio_input(
+            "Record your voice command (Click mic to Start, Click again to Stop)",
+            key="voice_page_recorder",
+        )
 
         if v_audio is not None:
             v_bytes = v_audio.getvalue()
             v_hash = hashlib.md5(v_bytes).hexdigest()
 
-            if st.session_state.get("last_voice_page_audio_hash") != v_hash:
-                st.session_state.last_voice_page_audio_hash = v_hash
-
+            # Process new audio if not staged and not already processed
+            if (
+                st.session_state.get("voice_page_staged_audio_hash") != v_hash
+                and st.session_state.get("voice_page_processed_audio_hash") != v_hash
+            ):
                 if not voice_tab_consent:
                     st.warning("⚠️ Please check the external processing consent box to enable voice transcription.")
                 elif len(v_bytes) < 200:
                     st.warning("⚠️ Recording empty or too short. Please speak clearly into your microphone.")
                 else:
-                    with st.spinner("🎧 Converting speech to text..."):
-                        t_res = transcribe_audio(v_bytes, engine="google", consent_external=voice_tab_consent)
+                    with st.spinner(f"🎧 Converting speech to text ({active_v_lang})..."):
+                        t_res = transcribe_audio(
+                            v_bytes,
+                            audio_format="wav",
+                            language=active_v_lang,
+                            engine=active_v_engine,
+                            consent_external=voice_tab_consent,
+                        )
 
                     if not t_res["success"]:
-                        st.error(f"❌ Speech Recognition Error: {t_res['error']}")
+                        st.error(f"❌ Speech Recognition Notice: {t_res['error']}")
+                        if t_res.get("error_type") in ("silence", "unknown_audio"):
+                            st.info(
+                                "💡 **Microphone Troubleshooting Tips:**\n"
+                                "- Check your browser's microphone permissions (lock icon in address bar).\n"
+                                "- Check that your physical microphone is connected and unmuted in Windows Sound Settings.\n"
+                                "- Speak closer to the microphone with clear articulation."
+                            )
                     else:
-                        spoken_query = t_res["text"]
-                        st.success(f"🗣️ You said: \"{spoken_query}\"")
+                        # Stage transcript for user review and editing
+                        st.session_state.voice_page_staged_audio_hash = v_hash
+                        st.session_state.voice_page_staged_audio_bytes = v_bytes
+                        st.session_state.voice_page_staged_transcript = t_res["text"]
+                        st.session_state.voice_page_staged_meta = t_res
+                        st.rerun()
+
+        # Staged Review and Edit Card
+        if st.session_state.get("voice_page_staged_transcript") is not None:
+            st.markdown("<hr style='margin: 12px 0; border-color: rgba(6, 182, 212, 0.3);'>", unsafe_allow_html=True)
+            st.markdown("#### 📝 Review & Edit Transcript Before Sending")
+            st.caption("Inspect and modify the recognized text below to correct any misheard words or slang before submitting to NOVA.")
+
+            vp_meta = st.session_state.get("voice_page_staged_meta", {})
+            vp_engine_name = vp_meta.get("engine_used", "speech engine")
+            vp_lang_used = vp_meta.get("language_used", active_v_lang)
+
+            st.markdown(
+                f"<div style='font-size: 0.82rem; color: #38bdf8; margin-bottom: 8px;'>"
+                f"🟢 <b>Status:</b> Ready for Review &nbsp;|&nbsp; "
+                f"⚙️ <b>Engine:</b> {vp_engine_name} &nbsp;|&nbsp; "
+                f"🗣️ <b>Language:</b> <code>{vp_lang_used}</code>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+            # Audio review playback
+            if st.session_state.get("voice_page_staged_audio_bytes"):
+                with st.expander("▶️ Listen to your recorded audio snippet", expanded=False):
+                    st.audio(st.session_state.voice_page_staged_audio_bytes, format="audio/wav")
+
+            # Editable transcript text area
+            edited_query = st.text_area(
+                "Recognized Text (Editable):",
+                value=st.session_state.voice_page_staged_transcript,
+                key="voice_page_transcript_editor",
+                height=90,
+                help="Edit any misheard words or punctuation before submitting to NOVA.",
+            )
+
+            v_btn1, v_btn2, v_btn3 = st.columns([1.8, 1.8, 3])
+            with v_btn1:
+                if st.button("🚀 Send to Assistant", type="primary", key="btn_send_voice_page_staged"):
+                    clean_spoken = edited_query.strip()
+                    if not clean_spoken:
+                        st.warning("⚠️ Message cannot be empty.")
+                    else:
+                        # Prevent re-transcribing same audio buffer
+                        st.session_state.voice_page_processed_audio_hash = st.session_state.get("voice_page_staged_audio_hash")
+                        st.session_state.voice_page_staged_transcript = None
+                        st.session_state.voice_page_staged_audio_hash = None
+                        st.session_state.voice_page_staged_audio_bytes = None
+                        st.session_state.voice_page_staged_meta = None
 
                         # Process with assistant
                         assistant = NovaAssistant()
-                        reply = assistant.process_message(spoken_query, conversation_id=st.session_state.conversation_id)
+                        with st.spinner("NOVA is thinking..."):
+                            reply = assistant.process_message(
+                                clean_spoken,
+                                conversation_id=st.session_state.conversation_id,
+                            )
 
                         # Synthesize speech
                         audio_speech = None
@@ -815,7 +1360,7 @@ elif selected_page == "🎙️ Voice Assistant":
 
                         # Append to voice conversation history
                         st.session_state.voice_messages.append({
-                            "user_text": spoken_query,
+                            "user_text": clean_spoken,
                             "assistant_text": reply["response"],
                             "audio_bytes": audio_speech,
                             "mode": reply.get("mode"),
@@ -824,7 +1369,7 @@ elif selected_page == "🎙️ Voice Assistant":
                         })
 
                         # Also mirror to general chat history
-                        st.session_state.chat_messages.append({"role": "user", "content": spoken_query, "source": "voice"})
+                        st.session_state.chat_messages.append({"role": "user", "content": clean_spoken, "source": "voice"})
                         st.session_state.chat_messages.append({
                             "role": "assistant",
                             "content": reply["response"],
@@ -833,9 +1378,22 @@ elif selected_page == "🎙️ Voice Assistant":
                             "mode": reply.get("mode"),
                         })
 
-                        record_activity("voice_interaction", metadata=f"Spoken: {spoken_query[:40]}")
-                        log_action("voice_interaction", f"Spoken query: {spoken_query}", status="success")
+                        record_activity("voice_interaction", metadata=f"Spoken: {clean_spoken[:40]}")
+                        log_action("voice_interaction", f"Spoken query: {clean_spoken}", status="success")
                         st.rerun()
+
+            with v_btn2:
+                if st.button("🔄 Discard & Retry", key="btn_discard_voice_page_staged"):
+                    st.session_state.voice_page_processed_audio_hash = st.session_state.get("voice_page_staged_audio_hash")
+                    st.session_state.voice_page_staged_transcript = None
+                    st.session_state.voice_page_staged_audio_hash = None
+                    st.session_state.voice_page_staged_audio_bytes = None
+                    st.session_state.voice_page_staged_meta = None
+                    st.info("Recording discarded. Click the microphone icon above to speak again.")
+                    st.rerun()
+
+            with v_btn3:
+                st.caption("Click **Send to Assistant** to submit, or **Discard & Retry** to re-record.")
 
         # Display Voice Dialogue Turns
         if not st.session_state.voice_messages:
@@ -863,63 +1421,167 @@ elif selected_page == "🎙️ Voice Assistant":
 
     with voice_tab2:
         st.subheader("🎙️ Speech-to-Text Laboratory (STT)")
-        st.caption("Test speech transcription independently to analyze accuracy and phonetics.")
+        st.caption("Test speech transcription independently to analyze acoustic accuracy, RMS energy levels, and phonetics.")
+
+        lab_c1, lab_c2 = st.columns(2)
+        with lab_c1:
+            stt_lab_lang_label = st.selectbox(
+                "🗣️ Test Language",
+                options=[
+                    "English (India) [en-IN] — Recommended",
+                    "Tamil / தமிழ் [ta-IN]",
+                    "Tanglish (Tamil + English Mixed)",
+                    "English (US) [en-US]",
+                ],
+                index=0,
+                key="stt_lab_lang_select",
+            )
+            lab_lang_map = {
+                "English (India) [en-IN] — Recommended": "en-IN",
+                "Tamil / தமிழ் [ta-IN]": "ta-IN",
+                "Tanglish (Tamil + English Mixed)": "tanglish",
+                "English (US) [en-US]": "en-US",
+            }
+            active_lab_lang = lab_lang_map.get(stt_lab_lang_label, "en-IN")
+
+        with lab_c2:
+            stt_lab_engine_label = st.selectbox(
+                "⚙️ Test Engine",
+                options=[
+                    "Auto (Gemini 1.5 Flash if available, else Google)",
+                    "Google Web Speech (Free $0.00)",
+                    "Google Gemini 1.5 Flash (Multimodal)",
+                ],
+                index=0,
+                key="stt_lab_engine_select",
+            )
+            lab_engine_map = {
+                "Auto (Gemini 1.5 Flash if available, else Google)": "auto",
+                "Google Web Speech (Free $0.00)": "google",
+                "Google Gemini 1.5 Flash (Multimodal)": "gemini",
+            }
+            active_lab_engine = lab_engine_map.get(stt_lab_engine_label, "auto")
 
         st.write("Record any test phrase below:")
         stt_test_audio = st.audio_input("Record speech sample", key="stt_lab_recorder")
 
         if stt_test_audio is not None:
             stt_bytes = stt_test_audio.getvalue()
-            st.write(f"- **Captured Audio Size:** `{len(stt_bytes) / 1024:.2f} KB`")
+            rms_energy = calculate_pcm_rms(stt_bytes)
+            audio_size_kb = len(stt_bytes) / 1024
+
+            st.write(f"- **Captured Audio Size:** `{audio_size_kb:.2f} KB`")
             st.write(f"- **Audio Container:** WAV (16kHz PCM mono)")
+            st.write(f"- **Calculated Audio Energy (RMS):** `{rms_energy:.1f}` {'🟢 (Good Signal)' if rms_energy > 200 else '🟡 (Quiet / Low Volume)' if rms_energy > 50 else '🔴 (Silent / Mic Muted)'}")
 
             if st.button("🚀 Transcribe Audio Sample", key="btn_run_stt_lab"):
-                with st.spinner("Transcribing..."):
-                    lab_res = transcribe_audio(stt_bytes, engine="google", consent_external=True)
+                with st.spinner(f"Transcribing using {active_lab_engine} ({active_lab_lang})..."):
+                    lab_res = transcribe_audio(
+                        stt_bytes,
+                        language=active_lab_lang,
+                        engine=active_lab_engine,
+                        consent_external=True,
+                    )
 
                 if lab_res["success"]:
                     st.success("✅ **Transcription Successful!**")
                     st.text_area("Recognized Text:", value=lab_res["text"], height=100)
-                    st.caption(f"Engine: `{lab_res['engine_used']}` | Word Count: {len(lab_res['text'].split())}")
+                    st.caption(
+                        f"Engine: `{lab_res['engine_used']}` | "
+                        f"Language Tag: `{lab_res['language_used']}` | "
+                        f"Word Count: {len(lab_res['text'].split())} | "
+                        f"Character Count: {len(lab_res['text'])}"
+                    )
                 else:
                     st.error(f"❌ Transcription Failed: {lab_res['error']} (Type: `{lab_res['error_type']}`)")
+                    if lab_res.get("error_type") == "silence":
+                        st.info("💡 The audio signal was silent. Check that your microphone is unmuted and the input volume is high enough.")
 
     with voice_tab3:
         st.subheader("🔊 Text-to-Speech Laboratory (TTS)")
-        st.caption("Synthesize custom text into natural speech with pronunciation normalization.")
+        st.caption("Synthesize custom text into natural speech with language detection and accent normalization.")
 
-        sample_prompt = st.text_area(
-            "Text to Synthesize",
-            value=(
+        # Preset sample sentences for quick testing
+        preset = st.selectbox(
+            "Load Sample Sentence",
+            [
+                "Custom Text (Type below)",
+                "English: NOVA Assistant Intro",
+                "Tamil: நோவா வரவேற்பு உரை (Greeting)",
+                "Tanglish: Study Schedule Reminder",
+            ],
+            index=0,
+            key="tts_sample_preset",
+        )
+
+        preset_texts = {
+            "English: NOVA Assistant Intro": (
                 "Hello! I am NOVA, your personal AI assistant. "
                 "I can track your tasks, manage study schedules, and process research documents."
             ),
+            "Tamil: நோவா வரவேற்பு உரை (Greeting)": (
+                "வணக்கம்! நான் நோவா, உங்கள் தனிப்பட்ட AI உதவியாளர். "
+                "உங்கள் பணிகள், நினைவூட்டல்கள் மற்றும் படிப்பு அட்டவணையை நிர்வகிக்க நான் உதவுகிறேன்."
+            ),
+            "Tanglish: Study Schedule Reminder": (
+                "Hello! Innaiku enna study plan irukku? "
+                "Unga AI assignments and data science tasks ellam ready-ah irukku."
+            ),
+        }
+
+        default_text = preset_texts.get(preset, "Hello! I am NOVA, your personal AI assistant.")
+        sample_prompt = st.text_area(
+            "Text to Synthesize",
+            value=default_text,
             height=120,
+            key="tts_lab_textarea",
         )
 
         tts_c1, tts_c2 = st.columns(2)
         with tts_c1:
             tts_accent = st.selectbox(
-                "Accent / Regional Dialect",
-                ["English (US)", "English (UK)", "English (Australia)", "English (India)"],
+                "Voice Language / Accent",
+                [
+                    "English (India) — co.in",
+                    "Tamil (தமிழ்) — Native Tamil",
+                    "English (US) — com",
+                    "English (UK) — co.uk",
+                    "English (Australia) — com.au",
+                ],
+                index=0,
+                key="tts_lab_accent_select",
             )
-            accent_map = {
-                "English (US)": "com",
-                "English (UK)": "co.uk",
-                "English (Australia)": "com.au",
-                "English (India)": "co.in",
-            }
+            # Map choice to lang and tld
+            if "Tamil" in tts_accent:
+                tts_lang = "ta"
+                tts_tld = "com"
+            else:
+                tts_lang = "en"
+                accent_tld_map = {
+                    "English (India) — co.in": "co.in",
+                    "English (US) — com": "com",
+                    "English (UK) — co.uk": "co.uk",
+                    "English (Australia) — com.au": "com.au",
+                }
+                tts_tld = accent_tld_map.get(tts_accent, "co.in")
+
         with tts_c2:
             tts_speed = st.checkbox("Slow Speed (Educational / Dictation mode)", value=False)
 
         if st.button("🔊 Synthesize & Play Speech", key="btn_run_tts_lab"):
             with st.spinner("Synthesizing speech with gTTS..."):
-                t_lab_res = synthesize_speech(sample_prompt, slow=tts_speed)
+                t_lab_res = synthesize_speech(
+                    sample_prompt,
+                    lang=tts_lang,
+                    tld=tts_tld,
+                    slow=tts_speed,
+                )
 
             if t_lab_res["success"]:
                 st.success("✅ **Speech Generated Successfully!**")
                 st.write("**Cleaned Spoken Transcript:**")
                 st.caption(f"\"{t_lab_res['cleaned_text']}\"")
+                st.caption(f"Language: `{t_lab_res.get('language_used', tts_lang)}` | Regional TLD: `{tts_tld}`")
                 st.audio(t_lab_res["audio_bytes"], format="audio/mp3", autoplay=True)
                 st.download_button(
                     "💾 Download MP3 Audio",
@@ -2081,6 +2743,445 @@ elif selected_page == "📊 Productivity Analytics":
             disabled=(len(activities_csv) == 0),
             use_container_width=True,
         )
+
+
+# -----------------------------------------------------------------------------
+# PAGE: SELF-LEARNING & TRAINING DASHBOARD
+# -----------------------------------------------------------------------------
+elif selected_page == "🧠 Self-Learning & Training":
+    st.markdown(
+        """
+        <div class="nova-card">
+            <h2 style="margin: 0; color: #f8fafc;">🧠 Self-Learning & Model Intelligence Dashboard</h2>
+            <p style="margin: 4px 0 0 0; color: #94a3b8; font-size: 0.95rem;">
+                Continuous in-context learning, verified human corrections, PII-sanitized dataset curation, and model fine-tuning diagnostics.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # 1. Real Metrics from Learning System
+    sys_metrics = get_learning_system_metrics()
+    fb = sys_metrics["feedback_summary"]
+    cur_model = sys_metrics["current_model"]
+
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.markdown(
+            f"""
+            <div class="nova-metric-card">
+                <div class="nova-metric-label">Approved Knowledge</div>
+                <div class="nova-metric-value" style="color: #22d3ee;">{sys_metrics['approved_memories']} Facts</div>
+                <div style="font-size: 0.75rem; color: #94a3b8; margin-top: 4px;">{sys_metrics['indexed_documents']} Docs &bull; {sys_metrics['document_chunks']} Chunks</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with m2:
+        st.markdown(
+            f"""
+            <div class="nova-metric-card">
+                <div class="nova-metric-label">Feedback & Corrections</div>
+                <div class="nova-metric-value" style="color: #c084fc;">{sys_metrics['approved_corrections']} Taught</div>
+                <div style="font-size: 0.75rem; color: #94a3b8; margin-top: 4px;">{fb['thumbs_up']} 👍 &bull; {fb['thumbs_down']} 👎 ({fb['satisfaction_rate']}% pos)</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with m3:
+        st.markdown(
+            f"""
+            <div class="nova-metric-card">
+                <div class="nova-metric-label">Training Datasets</div>
+                <div class="nova-metric-value" style="color: #10b981;">{sys_metrics['training_datasets_count']} Releases</div>
+                <div style="font-size: 0.75rem; color: #94a3b8; margin-top: 4px;">{sys_metrics['training_dataset_samples']} Chat JSONL Samples</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with m4:
+        eval_score_val = cur_model.get("eval_score") or 0.0
+        score_color = "#10b981" if eval_score_val >= 80 else ("#f59e0b" if eval_score_val >= 60 else "#fb7185")
+        st.markdown(
+            f"""
+            <div class="nova-metric-card">
+                <div class="nova-metric-label">Active Model & Eval</div>
+                <div class="nova-metric-value" style="color: {score_color};">{eval_score_val}%</div>
+                <div style="font-size: 0.75rem; color: #94a3b8; margin-top: 4px;">{cur_model.get('version_tag', 'v1.0')} ({cur_model.get('provider', 'base')})</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.caption(f"🕒 **Last Knowledge Base Update:** `{sys_metrics['last_knowledge_update']}` &bull; Database: SQLite (`nova.db`)")
+    st.write("")
+
+    # 2. Four Interactive Tabs
+    tab_arch, tab_corrections, tab_finetune, tab_benchmark = st.tabs([
+        "🏛️ Architecture & Data Separation",
+        "✏️ Verified Corrections Store",
+        "📦 Dataset Builder & Fine-Tuning",
+        "🎯 Benchmark & Model Registry",
+    ])
+
+    # -------------------------------------------------------------------------
+    # TAB 1: ARCHITECTURE & KNOWLEDGE SEPARATION
+    # -------------------------------------------------------------------------
+    with tab_arch:
+        st.subheader("🏛️ Strict Knowledge Store Separation")
+        st.markdown(
+            """
+            To prevent hallucinations, data poisoning, and privacy leaks, NOVA maintains **strict physical separation** across four independent layers of knowledge:
+            """
+        )
+
+        col_k1, col_k2 = st.columns(2)
+        with col_k1:
+            st.markdown(
+                """
+                <div style="background: #1e293b; border-left: 3px solid #38bdf8; padding: 14px; border-radius: 8px; margin-bottom: 12px;">
+                    <b style="color: #38bdf8;">1. Conversation History (Conversations)</b>
+                    <p style="font-size: 0.85rem; color: #94a3b8; margin: 4px 0 0 0;">
+                        Active and archived multi-turn chat threads. Session-specific dialogue is stored separately and is <b>never automatically promoted to permanent memory</b> without user confirmation.
+                    </p>
+                </div>
+                <div style="background: #1e293b; border-left: 3px solid #c084fc; padding: 14px; border-radius: 8px; margin-bottom: 12px;">
+                    <b style="color: #c084fc;">2. Personal Memory (Memories)</b>
+                    <p style="font-size: 0.85rem; color: #94a3b8; margin: 4px 0 0 0;">
+                        Persistent user facts, MSc research notes, project deadlines, and preferences. Stored in SQLite only upon explicit user command (<code>remember: ...</code> or via UI). Guarded against duplicate entries.
+                    </p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with col_k2:
+            st.markdown(
+                """
+                <div style="background: #1e293b; border-left: 3px solid #10b981; padding: 14px; border-radius: 8px; margin-bottom: 12px;">
+                    <b style="color: #10b981;">3. Document Knowledge Base (Documents)</b>
+                    <p style="font-size: 0.85rem; color: #94a3b8; margin: 4px 0 0 0;">
+                        Local PDF, TXT, and CSV documents chunked into overlapping passages. Retrieved strictly at question-time using local keyword/semantic RAG with transparent page number attribution.
+                    </p>
+                </div>
+                <div style="background: #1e293b; border-left: 3px solid #f59e0b; padding: 14px; border-radius: 8px; margin-bottom: 12px;">
+                    <b style="color: #f59e0b;">4. Training & Correction Store (Learning Examples)</b>
+                    <p style="font-size: 0.85rem; color: #94a3b8; margin: 4px 0 0 0;">
+                        Verified human corrections and consented feedback examples. Stored independently with approval flags, scrubbed of PII and secrets, and formatted for Chat JSONL fine-tuning releases.
+                    </p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("---")
+        st.subheader("🛡️ Privacy Guardrails & Sovereignty")
+        st.markdown(
+            """
+            - **No Blind Acceptance:** NOVA checks existing memories and corrections before writing new entries. Duplicate and conflicting facts are caught.
+            - **Consent-First Dataset Curation:** Thumbs-up dialogue turns are only included in training datasets if the user has opted in.
+            - **Zero Unintentional External Exposure:** Training datasets are stored locally in `data/datasets/` and scrubbed of API keys, emails, phone numbers, and IPs.
+            """
+        )
+
+        st.markdown("#### 💾 Export Personal Memories")
+        exp_col1, exp_col2 = st.columns(2)
+        with exp_col1:
+            json_mems = export_memories_json()
+            st.download_button(
+                "💾 Download Memories as JSON",
+                data=json_mems,
+                file_name="nova_memories_export.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+        with exp_col2:
+            csv_mems = export_memories_csv()
+            st.download_button(
+                "📄 Download Memories as CSV",
+                data=csv_mems,
+                file_name="nova_memories_export.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+    # -------------------------------------------------------------------------
+    # TAB 2: VERIFIED CORRECTIONS STORE
+    # -------------------------------------------------------------------------
+    with tab_corrections:
+        st.subheader("✏️ Human-in-the-Loop Corrections & Demonstrations")
+        st.markdown(
+            """
+            When NOVA provides an incorrect or incomplete response, you can teach it the correct answer.
+            NOVA stores your verified corrections and retrieves them dynamically during future questions.
+            """
+        )
+
+        # Form to add a verified correction
+        with st.expander("➕ Teach NOVA a New Demonstration or Correction", expanded=False):
+            with st.form("manual_teach_form"):
+                col_t1, col_t2 = st.columns([3, 1])
+                with col_t1:
+                    t_prompt = st.text_input("User Question / Trigger Prompt", placeholder="e.g. How to compute eigenvalues in NumPy?")
+                with col_t2:
+                    t_cat = st.selectbox("Category", ["Correction", "Demonstration", "DomainKnowledge", "Academic", "Code", "Preferences"])
+
+                t_good = st.text_area("Correct / Desired Answer", placeholder="Enter the exact, verified response NOVA should produce...", height=100)
+                t_bad = st.text_area("Incorrect / Rejected Answer (Optional)", placeholder="What did NOVA say that was wrong?", height=60)
+                t_expl = st.text_input("Explanation / Rationale (Optional)", placeholder="e.g. np.linalg.eig is preferred over custom power iteration")
+                t_appr = st.checkbox("Approve for active in-context retrieval and training dataset", value=True)
+
+                if st.form_submit_button("💾 Save Verified Demonstration", type="primary"):
+                    if not t_prompt.strip() or not t_good.strip():
+                        st.error("Prompt and Correct Answer are required.")
+                    else:
+                        res_corr = record_correction(
+                            user_prompt=t_prompt,
+                            corrected_response=t_good,
+                            rejected_response=t_bad,
+                            explanation=t_expl,
+                            category=t_cat,
+                            is_approved=t_appr,
+                            source="direct_entry",
+                        )
+                        st.success(f"Verified example #{res_corr['id']} saved to NOVA's learning store!")
+                        st.rerun()
+
+        st.markdown("#### 📚 Active Learning Examples")
+        corr_search_col, corr_filter_col = st.columns([3, 1])
+        with corr_search_col:
+            corr_query = st.text_input("Search corrections", placeholder="Filter by prompt or response keywords...", label_visibility="collapsed")
+        with corr_filter_col:
+            corr_cat_filter = st.selectbox("Category filter", ["All", "Correction", "Demonstration", "DomainKnowledge", "Academic", "Code", "Preferences"], label_visibility="collapsed")
+
+        examples = get_learning_examples(category=corr_cat_filter, search_query=corr_query, only_approved=False, limit=50)
+
+        if not examples:
+            st.info("No learning examples found matching your filter criteria.")
+        else:
+            for ex in examples:
+                status_badge = "badge-cyan" if ex["is_approved"] else "badge-rose"
+                status_text = "Approved for Retrieval" if ex["is_approved"] else "Pending Approval"
+                with st.expander(f"#{ex['id']} [{ex['category']}] {ex['user_prompt'][:70]}...", expanded=False):
+                    st.markdown(f'<span class="{status_badge}">{status_text}</span> &bull; Source: <code>{ex["source"]}</code> &bull; Created: {ex["created_at"][:10]}', unsafe_allow_html=True)
+                    st.write("")
+                    st.markdown("**User Prompt:**")
+                    st.code(ex["user_prompt"], language="text")
+                    st.markdown("**Verified Response:**")
+                    st.code(ex["corrected_response"], language="markdown")
+                    if ex.get("rejected_response"):
+                        st.markdown("**Original Rejected Response:**")
+                        st.caption(ex["rejected_response"])
+                    if ex.get("explanation"):
+                        st.markdown(f"**Explanation:** *{ex['explanation']}*")
+
+                    c_del1, _ = st.columns([1, 4])
+                    with c_del1:
+                        if st.button("🗑️ Delete Example", key=f"del_ex_{ex['id']}", type="secondary"):
+                            delete_correction(ex["id"])
+                            st.toast(f"Example #{ex['id']} deleted from learning store.")
+                            st.rerun()
+
+    # -------------------------------------------------------------------------
+    # TAB 3: DATASET BUILDER & FINE-TUNING
+    # -------------------------------------------------------------------------
+    with tab_finetune:
+        st.subheader("📦 Model Fine-Tuning & Dataset Pipeline")
+
+        # 1. Provider & Model Inspection
+        support = inspect_fine_tuning_support()
+        prov_c1, prov_c2 = st.columns([2, 1])
+        with prov_c1:
+            st.markdown(
+                f"""
+                <div style="background: #1e293b; padding: 14px; border-radius: 8px; margin-bottom: 12px; border: 1px solid #334155;">
+                    <div style="font-weight: 700; color: #f8fafc; font-size: 1rem;">Active Provider: {support['provider']} ({support['model']})</div>
+                    <div style="font-size: 0.85rem; color: #94a3b8; margin-top: 4px;">
+                        <b>Mechanism:</b> {support['supported_mechanism']}<br>
+                        <b>Free-Tier Reality:</b> {support['free_tier_status']}<br>
+                        <b>Cost Estimate:</b> {support['estimated_cost_per_1m_tokens']}
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with prov_c2:
+            st.markdown(
+                """
+                <div style="background: #131b2e; padding: 14px; border-radius: 8px; margin-bottom: 12px; border: 1px solid #0891b2;">
+                    <div style="font-weight: 700; color: #22d3ee; font-size: 0.9rem;">⚡ Zero-Cost In-Context Learning</div>
+                    <div style="font-size: 0.82rem; color: #94a3b8; margin-top: 4px;">
+                        NOVA automatically injects your approved corrections into prompts at inference time — providing continuous adaptation at <b>$0.00 cost</b> without paid cloud GPU tuning.
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        # Architectural Comparison Table
+        with st.expander("⚖️ When is Fine-Tuning Actually Necessary? (RAG vs Prompting vs Fine-Tuning)", expanded=False):
+            st.markdown(
+                """
+                | Technique | Best Used For | Latency & Cost | Data Freshness |
+                |---|---|---|---|
+                | **Prompt Engineering** | System persona, instructions, tone | Zero cost, instant | Instant |
+                | **Retrieval-Augmented Generation (RAG)** | Facts, documents, PDFs, dynamic memory, source attribution | Near-zero cost, fast | Real-time (upload & query) |
+                | **In-Context Learning (Few-Shot)** | Verified user corrections, few-shot examples | Near-zero cost, instant | Real-time (immediate) |
+                | **Model Fine-Tuning** | Complex style mimicry, novel syntax, fixed output schemas | High compute cost ($3+/1M tokens), slow | Static until retrained |
+
+                **Key Takeaway for MSc AI & Data Science Students:**
+                *Fine-tuning is not needed merely to give an LLM new facts* (use RAG and Memory instead). Fine-tuning is justified when teaching a specialized output format, syntax, or tone across thousands of examples.
+                """
+            )
+
+        st.markdown("---")
+        st.subheader("🔨 Build & Sanitize Training Dataset (Chat JSONL)")
+        st.markdown(
+            "Curate approved learning examples and consented feedback turns into standard Chat JSONL datasets with automated PII and secret scrubbing."
+        )
+
+        with st.form("build_dataset_form"):
+            b_col1, b_col2, b_col3 = st.columns([2, 1, 1])
+            with b_col1:
+                ds_name_input = st.text_input("Dataset Release Name", value=f"NOVA_v1_Curated_{date.today().isoformat()}")
+            with b_col2:
+                ds_val_ratio = st.slider("Validation Split", min_value=0.1, max_value=0.4, value=0.2, step=0.05, help="Proportion of samples reserved for validation")
+            with b_col3:
+                ds_include_fb = st.checkbox("Include 👍 Chats (Consented)", value=True, help="Include conversation turns with thumbs-up feedback")
+
+            build_submitted = st.form_submit_button("🔨 Build & Sanitize Dataset", type="primary")
+
+        if build_submitted:
+            try:
+                ds_result = build_training_dataset(
+                    name=ds_name_input,
+                    val_ratio=ds_val_ratio,
+                    include_thumbs_up_conversations=ds_include_fb,
+                )
+                st.success(f"✅ Training dataset `{ds_result['dataset_id']}` created successfully!")
+                
+                res_c1, res_c2, res_c3, res_c4 = st.columns(4)
+                with res_c1:
+                    st.metric("Total Samples", ds_result["total_samples"])
+                with res_c2:
+                    st.metric("Training Set", ds_result["train_samples"])
+                with res_c3:
+                    st.metric("Validation Set", ds_result["val_samples"])
+                with res_c4:
+                    st.metric("PII Redactions Applied", ds_result["redactions_applied"])
+
+                st.caption(f"📁 **Saved on disk:** `{ds_result['folder_path']}`")
+
+                # Provide direct download buttons
+                if Path(ds_result["train_file"]).exists():
+                    with open(ds_result["train_file"], "r", encoding="utf-8") as tf:
+                        t_data = tf.read()
+                    st.download_button(
+                        "📥 Download train.jsonl",
+                        data=t_data,
+                        file_name="train.jsonl",
+                        mime="application/jsonl",
+                    )
+            except Exception as e:
+                st.error(f"Failed to build dataset: {e}")
+
+        # Compute & Cost Estimator
+        st.markdown("---")
+        st.subheader("💰 Compute & Cost Estimator")
+        est_c1, est_c2, est_c3 = st.columns([1, 1, 1])
+        with est_c1:
+            est_samples = st.number_input("Estimated Samples", min_value=10, max_value=100000, value=max(50, sys_metrics["training_dataset_samples"] or 50), step=50)
+        with est_c2:
+            est_epochs = st.slider("Training Epochs", min_value=1, max_value=5, value=3)
+        with est_c3:
+            est_tokens = st.number_input("Avg Tokens / Sample", min_value=50, max_value=1000, value=180, step=20)
+
+        cost_est = estimate_training_compute_and_cost(
+            total_samples=est_samples,
+            avg_tokens_per_sample=est_tokens,
+            epochs=est_epochs,
+        )
+
+        ec1, ec2, ec3, ec4 = st.columns(4)
+        with ec1:
+            st.metric("Training Tokens", f"{cost_est['training_tokens']:,}")
+        with ec2:
+            st.metric("OpenAI Cost", f"${cost_est['cost_openai_usd']:.4f}")
+        with ec3:
+            st.metric("Gemini Vertex AI", f"${cost_est['cost_gemini_vertex_usd']:.4f}")
+        with ec4:
+            st.metric("In-Context Learning", "$0.00 (Free)")
+
+        st.caption("ℹ️ *Disclaimer: NOVA will NEVER trigger paid cloud fine-tuning jobs automatically without your explicit consent and cloud credentials.*")
+
+    # -------------------------------------------------------------------------
+    # TAB 4: BENCHMARK & MODEL REGISTRY
+    # -------------------------------------------------------------------------
+    with tab_benchmark:
+        st.subheader("🎯 Standardized Benchmark Evaluation & Model Registry")
+        st.markdown(
+            """
+            Verify real reasoning and assistant capabilities against a standardized benchmark suite.
+            The evaluation tests across **Python/NumPy data science**, **Machine Learning fundamentals**, and **Identity/Safety**.
+            """
+        )
+
+        b_run_col, b_info_col = st.columns([1, 2])
+        with b_run_col:
+            if st.button("🚀 Run Live Benchmark Suite", type="primary", use_container_width=True):
+                with st.spinner("Running standardized benchmark questions across models..."):
+                    eval_out = evaluate_model_performance(model_id=cur_model["id"])
+                    st.session_state.last_eval_out = eval_out
+                    st.success(f"Benchmark completed! Overall Score: {eval_out['overall_score']}%")
+
+        with b_info_col:
+            st.caption(
+                f"**Current Registered Model:** `{cur_model['id']}` &bull; "
+                f"**Tag:** `{cur_model['version_tag']}` &bull; "
+                f"**Status:** `{cur_model['status'].upper()}` &bull; "
+                f"**Benchmark Score:** `{cur_model.get('eval_score', 85.0)}%`"
+            )
+
+        # Show benchmark results if available
+        active_eval = st.session_state.get("last_eval_out")
+        if active_eval:
+            st.markdown("#### 📊 Evaluation Results Breakdown")
+            st.progress(active_eval["overall_score"] / 100.0)
+            
+            for t_res in active_eval["results"]:
+                sc = t_res["score"]
+                b_color = "#10b981" if sc >= 80 else ("#f59e0b" if sc >= 50 else "#fb7185")
+                with st.expander(f"{t_res['category']} — Score: {sc}%", expanded=True):
+                    st.write(f"**Prompt:** {t_res['prompt']}")
+                    st.write(f"**Expected Keywords:** `{'`, `'.join(t_res['expected_keywords'])}`")
+                    st.write(f"**Matched Keywords:** `{'`, `'.join(t_res['keywords_matched'])}`")
+
+        st.markdown("---")
+        st.subheader("⏪ Model Checkpoints & Safe Rollback")
+        st.markdown(
+            "If an updated model or fine-tuning run performs below expectations, roll back to any prior verified version checkpoint."
+        )
+
+        all_models = fetch_all("SELECT * FROM model_registry ORDER BY updated_at DESC")
+        if all_models:
+            df_models = pd.DataFrame(all_models)
+            cols_to_show = ["id", "version_tag", "provider", "base_model", "status", "eval_score", "updated_at"]
+            st.dataframe(df_models[[c for c in cols_to_show if c in df_models.columns]], use_container_width=True)
+
+            rb_col1, rb_col2 = st.columns([3, 1])
+            with rb_col1:
+                model_choices = [m["id"] for m in all_models]
+                selected_target_model = st.selectbox("Select Model Checkpoint to Restore", model_choices, index=0)
+            with rb_col2:
+                st.write("")
+                st.write("")
+                if st.button("⏪ Rollback to Checkpoint", use_container_width=True):
+                    ok = rollback_model_version(selected_target_model)
+                    if ok:
+                        st.toast(f"Active model successfully rolled back to '{selected_target_model}'!")
+                        st.rerun()
+                    else:
+                        st.error(f"Failed to rollback to '{selected_target_model}'.")
 
 
 # -----------------------------------------------------------------------------

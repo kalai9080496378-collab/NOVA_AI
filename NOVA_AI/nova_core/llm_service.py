@@ -74,6 +74,23 @@ class BaseLLMProvider(ABC):
         """Returns provider metadata, cost information, and limitations."""
         pass
 
+    def generate_stream(
+        self,
+        messages: List[Dict[str, str]],
+        system_prompt: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 1024,
+    ):
+        """Generates a text completion as a stream of string tokens."""
+        res = self.generate(messages, system_prompt, temperature, max_tokens)
+        if res.success:
+            words = res.content.split(" ")
+            for i, w in enumerate(words):
+                yield w + (" " if i < len(words) - 1 else "")
+        else:
+            yield res.error or "Error generating response."
+
+
 
 class GeminiProvider(BaseLLMProvider):
     """
@@ -254,6 +271,74 @@ class GeminiProvider(BaseLLMProvider):
                 error=f"Unexpected error communicating with Gemini API: {str(e)}",
                 error_type="unknown",
             )
+
+    def generate_stream(
+        self,
+        messages: List[Dict[str, str]],
+        system_prompt: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 1024,
+    ):
+        if not self.api_key:
+            yield "Google Gemini API key is missing. Set GEMINI_API_KEY in your .env file."
+            return
+
+        gemini_contents = []
+        for msg in messages:
+            role = "model" if msg.get("role") in {"assistant", "model"} else "user"
+            content_text = msg.get("content", "").strip()
+            if content_text:
+                gemini_contents.append({
+                    "role": role,
+                    "parts": [{"text": content_text}],
+                })
+
+        if not gemini_contents:
+            yield "No valid conversation messages provided."
+            return
+
+        payload: Dict[str, Any] = {
+            "contents": gemini_contents,
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": max_tokens,
+            },
+        }
+        if system_prompt:
+            payload["system_instruction"] = {
+                "parts": [{"text": system_prompt}]
+            }
+
+        headers = {
+            "Content-Type": "application/json",
+            "x-goog-api-key": self.api_key,
+        }
+
+        stream_url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:streamGenerateContent?alt=sse"
+        try:
+            with requests.post(stream_url, headers=headers, json=payload, stream=True, timeout=self.timeout) as resp:
+                if resp.status_code != 200:
+                    res = self.generate(messages, system_prompt, temperature, max_tokens)
+                    yield res.content if res.success else (res.error or "Error calling Gemini.")
+                    return
+                for line in resp.iter_lines(decode_unicode=True):
+                    if line and line.startswith("data: "):
+                        data_str = line[len("data: "):].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk_data = json.loads(data_str)
+                            candidates = chunk_data.get("candidates", [])
+                            if candidates:
+                                parts = candidates[0].get("content", {}).get("parts", [])
+                                chunk_text = "".join(p.get("text", "") for p in parts)
+                                if chunk_text:
+                                    yield chunk_text
+                        except Exception:
+                            continue
+        except Exception:
+            res = self.generate(messages, system_prompt, temperature, max_tokens)
+            yield res.content if res.success else (res.error or "Error streaming from Gemini.")
 
     def get_info(self) -> Dict[str, Any]:
         return {
@@ -436,6 +521,69 @@ class OpenAIProvider(BaseLLMProvider):
                 error=f"Unexpected error communicating with OpenAI API: {str(e)}",
                 error_type="unknown",
             )
+
+    def generate_stream(
+        self,
+        messages: List[Dict[str, str]],
+        system_prompt: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 1024,
+    ):
+        if not self.api_key:
+            yield "OpenAI API key is missing. Set OPENAI_API_KEY in your .env file."
+            return
+
+        formatted_messages = []
+        if system_prompt:
+            formatted_messages.append({"role": "system", "content": system_prompt})
+
+        for msg in messages:
+            content_text = msg.get("content", "").strip()
+            if content_text:
+                formatted_messages.append({
+                    "role": msg.get("role", "user"),
+                    "content": content_text,
+                })
+
+        if not formatted_messages:
+            yield "No valid conversation messages provided."
+            return
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+
+        payload = {
+            "model": self.model,
+            "messages": formatted_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+
+        try:
+            with requests.post(self.endpoint, headers=headers, json=payload, stream=True, timeout=self.timeout) as resp:
+                if resp.status_code != 200:
+                    res = self.generate(messages, system_prompt, temperature, max_tokens)
+                    yield res.content if res.success else (res.error or "Error calling OpenAI.")
+                    return
+                for line in resp.iter_lines(decode_unicode=True):
+                    if line and line.startswith("data: "):
+                        data_str = line[len("data: "):].strip()
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                            delta = chunk.get("choices", [{}])[0].get("delta", {})
+                            content = delta.get("content", "")
+                            if content:
+                                yield content
+                        except Exception:
+                            continue
+        except Exception:
+            res = self.generate(messages, system_prompt, temperature, max_tokens)
+            yield res.content if res.success else (res.error or "Error streaming from OpenAI.")
 
     def get_info(self) -> Dict[str, Any]:
         return {

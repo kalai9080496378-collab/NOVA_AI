@@ -14,6 +14,7 @@ from database.db import execute_insert, execute_query, fetch_all, fetch_one, log
 def save_memory(
     content: str,
     category: str = "General",
+    allow_duplicate: bool = False,
     db_path: Optional[Path | str] = None,
 ) -> Dict[str, Any]:
     """
@@ -22,6 +23,7 @@ def save_memory(
     Args:
         content: The text content to remember (required).
         category: 'General', 'Preferences', 'Academic', 'Projects', etc.
+        allow_duplicate: Whether to bypass duplicate rejection.
         db_path: Optional database override for testing.
         
     Returns:
@@ -32,6 +34,12 @@ def save_memory(
         raise ValueError("Memory content cannot be empty.")
 
     cleaned_category = category.strip().capitalize() if category else "General"
+
+    if not allow_duplicate:
+        dup = check_duplicate_memory(cleaned_content, db_path=db_path)
+        if dup:
+            raise ValueError(f"Duplicate knowledge rejected: Memory #{dup['id']} already stores this information.")
+
     now = datetime.now(timezone.utc).isoformat()
 
     sql = """
@@ -46,6 +54,12 @@ def save_memory(
 
     log_action("save_memory", f"Saved memory #{memory_id} in category '{cleaned_category}'", status="success", db_path=db_path)
     return get_memory_by_id(memory_id, db_path=db_path)
+
+
+def check_duplicate_memory(content: str, db_path: Optional[Path | str] = None) -> Optional[Dict[str, Any]]:
+    """Checks if an identical memory is already saved in SQLite."""
+    sql = "SELECT * FROM memories WHERE LOWER(content) = LOWER(?)"
+    return fetch_one(sql, (content.strip(),), db_path=db_path)
 
 
 def get_memory_by_id(memory_id: int, db_path: Optional[Path | str] = None) -> Optional[Dict[str, Any]]:
@@ -151,3 +165,24 @@ def search_memories(query: str, db_path: Optional[Path | str] = None) -> List[Di
         ORDER BY updated_at DESC
     """
     return fetch_all(sql, (cleaned, cleaned), db_path=db_path)
+
+
+def export_memories_csv(db_path: Optional[Path | str] = None) -> str:
+    """Exports all saved memories as a clean CSV string."""
+    import csv
+    import io
+    memories = get_all_memories(db_path=db_path)
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["id", "category", "content", "created_at", "updated_at"])
+    for m in memories:
+        writer.writerow([m["id"], m["category"], m["content"], m["created_at"], m["updated_at"]])
+    return buf.getvalue()
+
+
+def export_memories_json(db_path: Optional[Path | str] = None) -> str:
+    """Exports all saved memories as formatted JSON."""
+    import json
+    memories = get_all_memories(db_path=db_path)
+    return json.dumps({"count": len(memories), "memories": memories}, indent=2)
+

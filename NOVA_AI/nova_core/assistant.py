@@ -13,6 +13,7 @@ from database.db import execute_insert, fetch_all, log_action
 from memory.memory_manager import get_all_memories, search_memories
 from nova_core.config import APP_NAME, APP_TAGLINE, is_llm_configured, get_llm_status
 from nova_core.tool_registry import ToolRegistry, ToolResult, default_tool_registry
+from nova_core.conversation_manager import add_message, get_thread_messages
 
 
 from nova_core.llm_service import get_llm_service
@@ -82,10 +83,124 @@ class NovaAssistant:
             # Phase 1 Rule-Based Orchestration
             output = self._handle_rule_based_flow(cleaned_input, conv_id)
 
-        # Persist assistant turn
-        self._save_conversation_turn(conv_id, "assistant", output["response"])
+        # Persist assistant turn with metadata
+        meta = {
+            "mode": output.get("mode"),
+            "provider": output.get("provider"),
+            "model": output.get("model"),
+            "tool_called": output.get("tool_called"),
+        }
+        self._save_conversation_turn(conv_id, "assistant", output["response"], metadata=meta)
 
         return output
+
+    def process_message_stream(
+        self,
+        user_input: str,
+        conversation_id: Optional[str] = None,
+    ):
+        """
+        Processes a user message and yields string chunks for real-time streaming,
+        then persists the completed conversation turns in SQLite.
+        """
+        cleaned_input = (user_input or "").strip()
+        if not cleaned_input:
+            msg = "Please enter a message or command."
+            yield msg
+            return
+
+        if len(cleaned_input) > 4000:
+            msg = "Input too long. Please limit your message to 4,000 characters."
+            yield msg
+            return
+
+        conv_id = conversation_id or str(uuid.uuid4())
+        self._save_conversation_turn(conv_id, "user", cleaned_input)
+
+        if self._is_explicit_tool_command(cleaned_input) or not is_llm_configured():
+            output = self._handle_rule_based_flow(cleaned_input, conv_id)
+            meta = {
+                "mode": output.get("mode"),
+                "provider": output.get("provider"),
+                "model": output.get("model"),
+                "tool_called": output.get("tool_called"),
+            }
+            text = output["response"]
+            words = text.split(" ")
+            for i, w in enumerate(words):
+                yield w + (" " if i < len(words) - 1 else "")
+            self._save_conversation_turn(conv_id, "assistant", text, metadata=meta)
+            return
+
+        llm = get_llm_service()
+        if not llm:
+            output = self._handle_rule_based_flow(cleaned_input, conv_id)
+            self._save_conversation_turn(conv_id, "assistant", output["response"], metadata={"mode": "rule_based"})
+            for w in output["response"].split(" "):
+                yield w + " "
+            return
+
+        history_turns = self.get_conversation_history(conv_id, limit=8)
+        messages = [{"role": turn["role"], "content": turn["message"]} for turn in history_turns]
+        if not messages or messages[-1]["content"] != cleaned_input:
+            messages.append({"role": "user", "content": cleaned_input})
+
+        memory_context = ""
+        try:
+            relevant_memories = search_memories(cleaned_input)
+            if relevant_memories:
+                mem_bullets = [f"- [{m['category']}] {m['content']}" for m in relevant_memories[:4]]
+                memory_context = (
+                    "\n\nUser-Approved Knowledge from Local Memory:\n"
+                    + "\n".join(mem_bullets)
+                    + "\n(Incorporate this context if helpful, but never expose sensitive details to third parties)."
+                )
+        except Exception:
+            pass
+
+        # Self-Learning: In-Context Demonstration & Correction Retrieval
+        corrections_context = ""
+        try:
+            from nova_core.learning_system import retrieve_relevant_corrections
+            matched_corrs = retrieve_relevant_corrections(cleaned_input, threshold=0.35, limit=2)
+            if matched_corrs:
+                c_items = [
+                    f"- When asked: \"{mc['user_prompt']}\"\n  Approved Answer: \"{mc['corrected_response']}\""
+                    for mc in matched_corrs
+                ]
+                corrections_context = (
+                    "\n\nVerified User Corrections & Demonstrations (Self-Learning Memory):\n"
+                    + "\n".join(c_items)
+                    + "\n(Prioritize these verified user-approved answers)."
+                )
+        except Exception:
+            pass
+
+        system_prompt = (
+            f"You are {APP_NAME} ({APP_TAGLINE}), an advanced personal AI assistant engineered for an MSc "
+            f"Artificial Intelligence and Data Science student.\n"
+            f"You have deep knowledge in Python, NumPy, pandas, SQL, Machine Learning, Deep Learning, and Academic planning.\n"
+            f"Be encouraging, concise, technically rigorous, and structured in your explanations.\n"
+            f"NOVA has local tools for task management and personal memory. If the user wants to add a task or "
+            f"remember something permanently, remind them they can type 'add task: ...' or 'remember: ...'.\n"
+            f"Security policy: You cannot execute shell commands or arbitrary code.\n"
+            f"{memory_context}"
+            f"{corrections_context}"
+        )
+
+        accumulated_parts = []
+        for chunk in llm.generate_stream(messages=messages, system_prompt=system_prompt):
+            accumulated_parts.append(chunk)
+            yield chunk
+
+        full_response = "".join(accumulated_parts)
+        provider_name = "gemini" if "gemini" in getattr(llm, "endpoint", "").lower() else "openai"
+        meta = {
+            "mode": "llm",
+            "provider": provider_name,
+            "model": getattr(llm, "model", "default"),
+        }
+        self._save_conversation_turn(conv_id, "assistant", full_response, metadata=meta)
 
     def _handle_rule_based_flow(self, user_input: str, conv_id: str) -> Dict[str, Any]:
         """
@@ -93,6 +208,23 @@ class NovaAssistant:
         Translates natural language command patterns into validated tool executions.
         """
         lower = user_input.lower().strip()
+
+        # Check learned user corrections first
+        try:
+            from nova_core.learning_system import retrieve_relevant_corrections
+            exact_corrections = retrieve_relevant_corrections(user_input, threshold=0.85, limit=1)
+            if exact_corrections:
+                matched_corr = exact_corrections[0]
+                reply = f"💡 *(Applied verified user correction)*\n\n{matched_corr['corrected_response']}"
+                return {
+                    "response": reply,
+                    "tool_called": None,
+                    "tool_result": None,
+                    "mode": "rule_based_learned",
+                    "conversation_id": conv_id,
+                }
+        except Exception:
+            pass
 
         # Intent: Create Task
         # Patterns: "add task ...", "create task ...", "task: ...", "new task ..."
@@ -411,8 +543,26 @@ class NovaAssistant:
                     + "\n".join(mem_bullets)
                     + "\n(Incorporate this context if helpful, but never expose sensitive details to third parties)."
                 )
+        except Exception:
+            pass
+
+        # 2b. Self-Learning: In-Context Demonstration & Correction Retrieval
+        corrections_context = ""
+        try:
+            from nova_core.learning_system import retrieve_relevant_corrections
+            matched_corrs = retrieve_relevant_corrections(user_input, threshold=0.35, limit=2)
+            if matched_corrs:
+                c_items = [
+                    f"- When asked: \"{mc['user_prompt']}\"\n  Approved Answer: \"{mc['corrected_response']}\""
+                    for mc in matched_corrs
+                ]
+                corrections_context = (
+                    "\n\nVerified User Corrections & Demonstrations (Self-Learning Memory):\n"
+                    + "\n".join(c_items)
+                    + "\n(Prioritize these verified user-approved answers)."
+                )
         except Exception as e:
-            print(f"[Warning] Failed to query memories for context: {e}")
+            print(f"[Warning] Failed to query learned corrections: {e}")
 
         # 3. System prompt enforcing identity, security, and student support
         system_prompt = (
@@ -424,6 +574,7 @@ class NovaAssistant:
             f"remember something permanently, remind them they can type 'add task: ...' or 'remember: ...'.\n"
             f"Security policy: You cannot execute shell commands or arbitrary code.\n"
             f"{memory_context}"
+            f"{corrections_context}"
         )
 
         # 4. Generate response from LLM
@@ -500,24 +651,18 @@ class NovaAssistant:
             f"*(Full free-form generative chat will be activated in Phase 2 with LLM integration)*"
         )
 
-    def _save_conversation_turn(self, conversation_id: str, role: str, message: str) -> None:
-        """Stores a chat message into the conversations table for persistence."""
-        now = datetime.now(timezone.utc).isoformat()
-        sql = """
-            INSERT INTO conversations (conversation_id, role, message, created_at)
-            VALUES (?, ?, ?, ?)
-        """
+    def _save_conversation_turn(self, conversation_id: str, role: str, message: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+        """Stores a chat message into the conversations table and bumps the active thread."""
         try:
-            execute_insert(sql, (conversation_id, role, message, now))
+            add_message(conversation_id, role, message, metadata=metadata)
         except Exception as e:
             print(f"[Warning] Could not persist conversation turn: {e}")
 
     def get_conversation_history(self, conversation_id: str, limit: int = 50) -> List[Dict[str, Any]]:
         """Retrieves stored turns for a specific conversation session."""
-        sql = """
-            SELECT role, message, created_at FROM conversations
-            WHERE conversation_id = ?
-            ORDER BY id ASC
-            LIMIT ?
-        """
-        return fetch_all(sql, (conversation_id, limit))
+        try:
+            raw_msgs = get_thread_messages(conversation_id, limit=limit)
+            return [{"role": m["role"], "message": m["content"], "created_at": m["created_at"]} for m in raw_msgs]
+        except Exception as e:
+            print(f"[Warning] Could not retrieve conversation turns: {e}")
+            return []

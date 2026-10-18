@@ -34,12 +34,29 @@ CREATE TABLE IF NOT EXISTS memories (
 
 CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
 
--- 3. Conversations Table: Dialogue history for multi-turn chat
+-- 3. Chat Threads Table: Persistent multi-conversation management (ChatGPT-style)
+CREATE TABLE IF NOT EXISTS chat_threads (
+    id TEXT PRIMARY KEY,                       -- Unique thread ID (UUID)
+    title TEXT NOT NULL DEFAULT 'New Chat',    -- User-visible conversation title
+    model TEXT DEFAULT 'gemini-1.5-flash',     -- Model associated with thread
+    system_prompt TEXT,                        -- Optional thread custom instructions
+    is_pinned INTEGER NOT NULL DEFAULT 0,      -- 1 = pinned to top
+    is_archived INTEGER NOT NULL DEFAULT 0,    -- 1 = archived (hidden from active list)
+    created_at TEXT NOT NULL,                  -- ISO timestamp
+    updated_at TEXT NOT NULL                   -- ISO timestamp
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_threads_updated ON chat_threads(updated_at);
+CREATE INDEX IF NOT EXISTS idx_chat_threads_archived ON chat_threads(is_archived);
+CREATE INDEX IF NOT EXISTS idx_chat_threads_pinned ON chat_threads(is_pinned);
+
+-- 3b. Conversations / Messages Table: Dialogue turns in a chat thread
 CREATE TABLE IF NOT EXISTS conversations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    conversation_id TEXT NOT NULL,             -- Unique session identifier
+    conversation_id TEXT NOT NULL,             -- Matches chat_threads.id
     role TEXT NOT NULL,                        -- 'user', 'assistant', 'system'
     message TEXT NOT NULL,
+    metadata TEXT,                             -- Optional JSON: tokens, tool_called, audio, model
     created_at TEXT NOT NULL                   -- ISO timestamp
 );
 
@@ -125,3 +142,69 @@ CREATE TABLE IF NOT EXISTS daily_plans (
 );
 
 CREATE INDEX IF NOT EXISTS idx_daily_plans_date ON daily_plans(plan_date);
+
+-- 10. Message Feedback Table: Tracks user rating (thumbs up / down) and feedback comments
+CREATE TABLE IF NOT EXISTS message_feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER,
+    conversation_id TEXT NOT NULL,
+    rating TEXT NOT NULL,                     -- 'thumbs_up', 'thumbs_down'
+    feedback_text TEXT,
+    is_approved_for_training INTEGER NOT NULL DEFAULT 0, -- Explicit user consent flag
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_feedback_msg ON message_feedback(message_id);
+CREATE INDEX IF NOT EXISTS idx_feedback_conv ON message_feedback(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_feedback_rating ON message_feedback(rating);
+
+-- 11. Learning Examples Table: Verified user corrections and approved demonstration pairs
+CREATE TABLE IF NOT EXISTS learning_examples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    category TEXT NOT NULL DEFAULT 'Correction', -- 'Correction', 'Demonstration', 'DomainKnowledge'
+    user_prompt TEXT NOT NULL,
+    rejected_response TEXT,
+    corrected_response TEXT NOT NULL,
+    explanation TEXT,
+    is_approved INTEGER NOT NULL DEFAULT 1,     -- Only approved examples are retrieved
+    is_used_in_training INTEGER NOT NULL DEFAULT 0,
+    source TEXT NOT NULL DEFAULT 'user_correction', -- 'user_correction', 'direct_entry'
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_learning_approved ON learning_examples(is_approved);
+CREATE INDEX IF NOT EXISTS idx_learning_category ON learning_examples(category);
+
+-- 12. Training Datasets Table: Tracks curated, validated, split dataset releases
+CREATE TABLE IF NOT EXISTS training_datasets (
+    id TEXT PRIMARY KEY,                       -- e.g., 'ds_20261018_xxx'
+    name TEXT NOT NULL,
+    total_samples INTEGER NOT NULL DEFAULT 0,
+    train_samples INTEGER NOT NULL DEFAULT 0,
+    val_samples INTEGER NOT NULL DEFAULT 0,
+    format TEXT NOT NULL DEFAULT 'chat_jsonl',  -- 'chat_jsonl', 'instruction_json'
+    storage_path TEXT NOT NULL,                -- Relative file path under data/datasets/
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_datasets_created ON training_datasets(created_at);
+
+-- 13. Model Registry Table: Tracks model checkpoints, evaluation benchmarks, and active version
+CREATE TABLE IF NOT EXISTS model_registry (
+    id TEXT PRIMARY KEY,                       -- e.g., 'model_v1_base', 'model_v2_tuned'
+    version_tag TEXT NOT NULL,                 -- 'v1.0.0-base', 'v1.1.0-incontext', etc.
+    provider TEXT NOT NULL,                    -- 'gemini', 'openai', 'in_context_hybrid'
+    base_model TEXT NOT NULL,                  -- 'gemini-1.5-flash', 'gpt-4o-mini', 'rule_based'
+    status TEXT NOT NULL DEFAULT 'active',     -- 'active', 'evaluating', 'archived', 'rolled_back'
+    is_fine_tuned INTEGER NOT NULL DEFAULT 0,  -- 0 = base/in-context, 1 = fine-tuned weight checkpoint
+    eval_score REAL DEFAULT 0.0,               -- Benchmark accuracy score (0.0 to 100.0)
+    eval_details TEXT,                         -- JSON string of test case evaluations
+    training_cost_usd REAL DEFAULT 0.0,        -- Estimated or actual cost in USD
+    dataset_id TEXT REFERENCES training_datasets(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_models_status ON model_registry(status);
+
