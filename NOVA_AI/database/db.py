@@ -1,0 +1,169 @@
+"""
+NOVA Database Manager
+Provides safe, parameterized SQLite operations and table initialization.
+"""
+
+import sqlite3
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+
+# Determine paths relative to project root
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data"
+DEFAULT_DB_PATH = DATA_DIR / "nova.db"
+SCHEMA_PATH = BASE_DIR / "database" / "schema.sql"
+
+# Allow environment override if set
+_env_db = os.getenv("DATABASE_PATH")
+if _env_db:
+    DATABASE_PATH = Path(_env_db)
+    if not DATABASE_PATH.is_absolute():
+        DATABASE_PATH = BASE_DIR / DATABASE_PATH
+else:
+    DATABASE_PATH = DEFAULT_DB_PATH
+
+
+def get_connection(db_path: Optional[Path | str] = None) -> sqlite3.Connection:
+    """
+    Creates and returns a connection to the SQLite database.
+    Ensures that the target directory exists before opening.
+    Enables sqlite3.Row for dictionary-like column access.
+    """
+    target_path = Path(db_path) if db_path else DATABASE_PATH
+    
+    # Ensure the parent directory exists
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Connect with check_same_thread=False for Streamlit concurrency
+    conn = sqlite3.connect(str(target_path), check_same_thread=False, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    
+    # Enable foreign keys
+    conn.execute("PRAGMA foreign_keys = ON;")
+    return conn
+
+
+def init_db(db_path: Optional[Path | str] = None) -> bool:
+    """
+    Initializes the database schema if tables do not already exist.
+    Reads DDL statements from database/schema.sql.
+    """
+    target_path = Path(db_path) if db_path else DATABASE_PATH
+    try:
+        if not SCHEMA_PATH.exists():
+            raise FileNotFoundError(f"Schema file not found at: {SCHEMA_PATH}")
+        
+        with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
+            schema_sql = f.read()
+
+        conn = get_connection(target_path)
+        try:
+            with conn:
+                cursor = conn.cursor()
+
+                # Check if tasks table exists already to apply column migrations first
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='tasks'")
+                if cursor.fetchone():
+                    cursor.execute("PRAGMA table_info(tasks)")
+                    columns = [row["name"] for row in cursor.fetchall()]
+
+                    if "category" not in columns:
+                        cursor.execute("ALTER TABLE tasks ADD COLUMN category TEXT NOT NULL DEFAULT 'General'")
+                    if "due_time" not in columns:
+                        cursor.execute("ALTER TABLE tasks ADD COLUMN due_time TEXT")
+                    if "estimated_duration" not in columns:
+                        cursor.execute("ALTER TABLE tasks ADD COLUMN estimated_duration INTEGER DEFAULT 60")
+                    if "completed_at" not in columns:
+                        cursor.execute("ALTER TABLE tasks ADD COLUMN completed_at TEXT")
+
+                # Execute schema SQL (creates tables and indexes if not exists)
+                conn.executescript(schema_sql)
+
+            return True
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[NOVA Database Error] Failed to initialize database: {e}")
+        raise
+
+
+def execute_query(sql: str, params: tuple = (), db_path: Optional[Path | str] = None) -> int:
+    """
+    Executes an UPDATE, DELETE, or DDL query with parameterized values.
+    Returns the number of affected rows.
+    """
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            cursor = conn.cursor()
+            cursor.execute(sql, params)
+            return cursor.rowcount
+    finally:
+        conn.close()
+
+
+def execute_insert(sql: str, params: tuple = (), db_path: Optional[Path | str] = None) -> int:
+    """
+    Executes an INSERT query with parameterized values.
+    Returns the last inserted row ID.
+    """
+    conn = get_connection(db_path)
+    try:
+        with conn:
+            cursor = conn.cursor()
+            cursor.execute(sql, params)
+            return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def fetch_all(sql: str, params: tuple = (), db_path: Optional[Path | str] = None) -> List[Dict[str, Any]]:
+    """
+    Executes a SELECT query and returns all matching rows as dictionaries.
+    """
+    conn = get_connection(db_path)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(sql, params)
+        rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def fetch_one(sql: str, params: tuple = (), db_path: Optional[Path | str] = None) -> Optional[Dict[str, Any]]:
+    """
+    Executes a SELECT query and returns a single row as a dictionary, or None.
+    """
+    conn = get_connection(db_path)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(sql, params)
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def log_action(
+    action_type: str,
+    details: str,
+    status: str = "success",
+    db_path: Optional[Path | str] = None
+) -> int:
+    """
+    Auditable action logging for tools and state modifications.
+    Records status ('proposed', 'confirmed', 'success', 'failed').
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    sql = """
+        INSERT INTO action_logs (action_type, details, status, created_at)
+        VALUES (?, ?, ?, ?)
+    """
+    try:
+        return execute_insert(sql, (action_type, details, status, now), db_path=db_path)
+    except Exception as e:
+        print(f"[NOVA Logging Error] Could not record action log: {e}")
+        return -1
