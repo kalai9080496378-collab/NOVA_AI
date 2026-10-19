@@ -234,3 +234,56 @@ def test_assistant_process_message_stream(temp_db, monkeypatch):
     assert msgs[0]["content"] == "stats"
     assert msgs[1]["role"] == "assistant"
 
+
+def test_fresh_session_starts_with_empty_conversation_no_default_qa(temp_db):
+    """Verify that a fresh session creates an empty conversation with no default Q&A."""
+    user_id = "user_clean_test"
+    existing = get_all_threads(include_archived=False, user_id=user_id, db_path=temp_db)
+    empty_th = None
+    for eth in existing:
+        if not get_thread_messages(eth["id"], limit=1, user_id=user_id, db_path=temp_db):
+            empty_th = eth
+            break
+
+    if empty_th:
+        active_th = empty_th
+    else:
+        active_th = create_thread(title="New Conversation", user_id=user_id, db_path=temp_db)
+
+    assert active_th is not None
+    messages = get_thread_messages(active_th["id"], user_id=user_id, db_path=temp_db)
+    assert messages == []
+
+
+def test_new_chat_preserves_previous_threads_without_loading_them_by_default(temp_db):
+    """Verify that previous chats are preserved, but a new chat starts completely empty."""
+    user_id = "user_clean_test_2"
+    # Thread 1 with a conversation
+    th1 = create_thread(title="Past Discussion", user_id=user_id, db_path=temp_db)
+    add_message(th1["id"], "user", "What is quantum computing?", user_id=user_id, db_path=temp_db)
+    add_message(th1["id"], "assistant", "Quantum computing uses qubits.", user_id=user_id, db_path=temp_db)
+
+    # User initiates a new chat or starts a new session
+    existing = get_all_threads(include_archived=False, user_id=user_id, db_path=temp_db)
+    empty_th = None
+    for eth in existing:
+        if not get_thread_messages(eth["id"], limit=1, user_id=user_id, db_path=temp_db):
+            empty_th = eth
+            break
+
+    if empty_th:
+        active_th = empty_th
+    else:
+        active_th = create_thread(title="New Conversation", user_id=user_id, db_path=temp_db)
+
+    # Active thread must be fresh and completely empty
+    assert active_th["id"] != th1["id"]
+    messages = get_thread_messages(active_th["id"], user_id=user_id, db_path=temp_db)
+    assert messages == []
+
+    # Thread 1's history is preserved
+    th1_msgs = get_thread_messages(th1["id"], user_id=user_id, db_path=temp_db)
+    assert len(th1_msgs) == 2
+    assert th1_msgs[0]["content"] == "What is quantum computing?"
+
+

@@ -6,6 +6,7 @@ Professional AI Platform: Streamlit User Interface & Multi-User System
 ====================================================================
 """
 
+import sys
 import os
 import re
 import json
@@ -15,6 +16,11 @@ from datetime import datetime, date, timedelta
 from pathlib import Path
 import streamlit as st
 import pandas as pd
+
+# Ensure project root is in sys.path dynamically regardless of execution directory
+PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 # Core NOVA Imports
 from database.db import init_db, DATABASE_PATH, log_action, fetch_all, fetch_one
@@ -32,7 +38,10 @@ from nova_core.config import (
     APP_VERSION,
     get_llm_status,
     get_voice_status,
+    is_llm_configured,
+    get_gemini_api_key,
 )
+from nova_core.llm_service import validate_gemini_key, _mask_key
 from nova_core.assistant import NovaAssistant
 from nova_core.conversation_manager import (
     create_thread,
@@ -472,8 +481,13 @@ if st.session_state.get("active_thread_id"):
 
 if not active_th:
     user_threads = get_all_threads(include_archived=False, user_id=active_user_id)
-    if user_threads:
-        st.session_state.active_thread_id = user_threads[0]["id"]
+    empty_thread = None
+    for th in user_threads:
+        if not get_thread_messages(th["id"], limit=1, user_id=active_user_id):
+            empty_thread = th
+            break
+    if empty_thread:
+        st.session_state.active_thread_id = empty_thread["id"]
     else:
         new_th = create_thread(title="New Conversation", user_id=active_user_id)
         st.session_state.active_thread_id = new_th["id"]
@@ -502,8 +516,8 @@ if "last_voice_page_audio_hash" not in st.session_state:
     st.session_state.last_voice_page_audio_hash = None
 
 # Unified Message Composer & Voice Transcription State
-if "chat_composer_text" not in st.session_state:
-    st.session_state.chat_composer_text = ""
+if "chat_composer_input" not in st.session_state:
+    st.session_state.chat_composer_input = ""
 if "chat_stt_audio_hash" not in st.session_state:
     st.session_state.chat_stt_audio_hash = None
 if "voice_just_transcribed" not in st.session_state:
@@ -604,9 +618,18 @@ with st.sidebar:
 
         # + New Chat Button (Isolated to active_user_id)
         if st.button("➕ New Chat", use_container_width=True, type="primary", key="sb_new_chat_btn"):
-            new_th = create_thread(title="New Conversation", user_id=active_user_id)
+            empty_th = None
+            for eth in active_threads:
+                if not get_thread_messages(eth["id"], limit=1, user_id=active_user_id):
+                    empty_th = eth
+                    break
+            if empty_th:
+                new_th = empty_th
+            else:
+                new_th = create_thread(title="New Conversation", user_id=active_user_id)
             st.session_state.active_thread_id = new_th["id"]
             st.session_state.conversation_id = new_th["id"]
+            st.session_state["chat_composer_input"] = ""
             st.session_state.pending_prompt = None
             st.rerun()
 
@@ -662,18 +685,19 @@ with st.sidebar:
                             if st.button("📦 Archive", key=f"sb_arch_{th['id']}", use_container_width=True):
                                 update_thread(th["id"], is_archived=True, user_id=active_user_id)
                                 if st.session_state.active_thread_id == th["id"]:
-                                    rem = [t for t in active_threads if t["id"] != th["id"]]
-                                    st.session_state.active_thread_id = rem[0]["id"] if rem else create_thread(user_id=active_user_id)["id"]
-                                    st.session_state.conversation_id = st.session_state.active_thread_id
-                                Cool = True
+                                    new_th = create_thread(title="New Conversation", user_id=active_user_id)
+                                    st.session_state.active_thread_id = new_th["id"]
+                                    st.session_state.conversation_id = new_th["id"]
+                                    st.session_state["chat_composer_input"] = ""
                                 st.rerun()
 
                             if st.button("🗑️ Delete", key=f"sb_del_{th['id']}", use_container_width=True):
                                 delete_thread(th["id"], user_id=active_user_id)
                                 if st.session_state.active_thread_id == th["id"]:
-                                    rem = [t for t in active_threads if t["id"] != th["id"]]
-                                    st.session_state.active_thread_id = rem[0]["id"] if rem else create_thread(user_id=active_user_id)["id"]
-                                    st.session_state.conversation_id = st.session_state.active_thread_id
+                                    new_th = create_thread(title="New Conversation", user_id=active_user_id)
+                                    st.session_state.active_thread_id = new_th["id"]
+                                    st.session_state.conversation_id = new_th["id"]
+                                    st.session_state["chat_composer_input"] = ""
                                 st.rerun()
 
         if archived_only:
@@ -876,744 +900,194 @@ elif selected_page == "💬 AI Chat":
     active_th = get_thread(st.session_state.active_thread_id, user_id=active_user_id)
     if not active_th:
         existing = get_all_threads(include_archived=False, user_id=active_user_id)
-        if existing:
-            st.session_state.active_thread_id = existing[0]["id"]
-            active_th = existing[0]
+        empty_th = None
+        for eth in existing:
+            if not get_thread_messages(eth["id"], limit=1, user_id=active_user_id):
+                empty_th = eth
+                break
+        if empty_th:
+            active_th = empty_th
         else:
             active_th = create_thread(title="New Conversation", user_id=active_user_id)
-            st.session_state.active_thread_id = active_th["id"]
+        st.session_state.active_thread_id = active_th["id"]
 
     st.session_state.conversation_id = st.session_state.active_thread_id
 
-    # 2. Modern Conversation Header with inline management & export
-    th_c1, th_c2, th_c3 = st.columns([5, 1, 1])
-    with th_c1:
-        pin_badge = "📌 " if active_th.get("is_pinned") else ""
+    # 2. Minimal Chat Header
+    hdr_c1, hdr_c2, hdr_c3 = st.columns([5, 1.3, 1.1], vertical_alignment="center")
+    with hdr_c1:
         st.markdown(
             f"""
-            <div style="margin-bottom: 4px;">
-                <h2 style="margin: 0; color: #f8fafc; font-size: 1.6rem;">{pin_badge}{active_th['title']}</h2>
-                <div style="font-size: 0.8rem; color: #94a3b8; margin-top: 3px;">
-                    Model: <code>{active_th.get('model', 'gemini-1.5-flash')}</code> &bull; 
-                    Created: {active_th['created_at'][:10]} &bull; 
-                    Session ID: <code>{active_th['id'][:8]}...</code> &bull;
-                    User: <code>@{current_user['username']}</code>
-                </div>
+            <div style="display: flex; align-items: center; gap: 8px;">
+                <h3 style="margin: 0; color: #f8fafc; font-size: 1.35rem; font-weight: 600;">{active_th['title']}</h3>
             </div>
             """,
             unsafe_allow_html=True,
         )
-    with th_c2:
-        with st.popover("⚙️ Thread", help="Manage this conversation"):
-            st.caption(f"**Settings for #{active_th['id'][:8]}**")
-            with st.form("main_th_rename"):
-                renamed = st.text_input("Title", value=active_th["title"])
-                if st.form_submit_button("✏️ Rename"):
-                    if renamed.strip():
-                        update_thread(active_th["id"], title=renamed.strip(), user_id=active_user_id)
-                        st.rerun()
-
-            p_label = "Unpin" if active_th.get("is_pinned") else "📌 Pin to top"
-            if st.button(p_label, use_container_width=True, key="hdr_pin_btn"):
-                update_thread(active_th["id"], is_pinned=not active_th.get("is_pinned"), user_id=active_user_id)
-                st.rerun()
-
-            if st.button("➕ New Chat", use_container_width=True, key="hdr_new_btn"):
+    with hdr_c2:
+        if st.button("➕ New Chat", key="chat_page_new_chat_btn", use_container_width=True):
+            user_threads = get_all_threads(include_archived=False, user_id=active_user_id)
+            empty_th = None
+            for eth in user_threads:
+                if not get_thread_messages(eth["id"], limit=1, user_id=active_user_id):
+                    empty_th = eth
+                    break
+            if empty_th:
+                nth = empty_th
+            else:
+                nth = create_thread(title="New Conversation", user_id=active_user_id)
+            st.session_state.active_thread_id = nth["id"]
+            st.session_state.conversation_id = nth["id"]
+            st.session_state["chat_composer_input"] = ""
+            st.session_state.pop("pending_chat_prompt", None)
+            st.rerun()
+    with hdr_c3:
+        with st.popover("⚙️ Manage", help="Thread options"):
+            renamed = st.text_input("Title", value=active_th["title"], key=f"th_ren_{active_th['id']}")
+            if st.button("Rename", key="btn_th_rename_save", use_container_width=True):
+                if renamed.strip():
+                    update_thread(active_th["id"], title=renamed.strip(), user_id=active_user_id)
+                    st.rerun()
+            if st.button("🗑️ Delete", key="btn_th_del_chat", type="secondary", use_container_width=True):
+                delete_thread(active_th["id"], user_id=active_user_id)
                 nth = create_thread(title="New Conversation", user_id=active_user_id)
                 st.session_state.active_thread_id = nth["id"]
                 st.session_state.conversation_id = nth["id"]
-                st.session_state.pending_prompt = None
+                st.session_state["chat_composer_input"] = ""
+                st.session_state.pop("pending_chat_prompt", None)
                 st.rerun()
 
-            if st.button("📦 Archive", use_container_width=True, key="hdr_arch_btn"):
-                update_thread(active_th["id"], is_archived=True, user_id=active_user_id)
-                rem = get_all_threads(include_archived=False, user_id=active_user_id)
-                st.session_state.active_thread_id = rem[0]["id"] if rem else create_thread(user_id=active_user_id)["id"]
-                st.session_state.conversation_id = st.session_state.active_thread_id
-                st.rerun()
-
-            if st.button("🗑️ Delete Thread", type="secondary", use_container_width=True, key="hdr_del_btn"):
-                delete_thread(active_th["id"], user_id=active_user_id)
-                rem = get_all_threads(include_archived=False, user_id=active_user_id)
-                st.session_state.active_thread_id = rem[0]["id"] if rem else create_thread(user_id=active_user_id)["id"]
-                st.session_state.conversation_id = st.session_state.active_thread_id
-                st.rerun()
-
-    with th_c3:
-        with st.popover("📥 Export", help="Export this chat"):
-            st.caption("**Export Options**")
-            md_content = export_thread_markdown(active_th["id"], user_id=active_user_id)
-            json_content = export_thread_json(active_th["id"], user_id=active_user_id)
-            safe_slug = re.sub(r"[^a-zA-Z0-9_\-]+", "_", active_th["title"]).lower()
-            st.download_button(
-                "📄 Markdown (.md)",
-                data=md_content,
-                file_name=f"nova_{safe_slug}.md",
-                mime="text/markdown",
-                use_container_width=True,
-            )
-            st.download_button(
-                "💾 JSON (.json)",
-                data=json_content,
-                file_name=f"nova_{safe_slug}.json",
-                mime="application/json",
-                use_container_width=True,
-            )
-
-    # Mode notification
+    # 3. Check Real AI status
     llm_info = get_llm_status()
-    if llm_info["status"] == "connected":
-        st.caption(
-            f"⚡ **Generative AI Connected ({llm_info['provider']} - {llm_info.get('model', '')})**. "
-            "Ask natural conversational questions, seek study and code advice, or use local task and memory commands."
-        )
-    else:
-        st.info(
-            "💡 **Running in Rule-Based Mode (No API key configured)**. "
-            "You can type commands like `add task: Complete project due 2026-10-31`, `show tasks`, "
-            "`remember: [Academic] Exam in room 301`, `stats`, `time`, or `help`.\n\n"
-            "*(To enable AI reasoning, add your free GEMINI_API_KEY in `.env`)*"
+    if llm_info.get("status") != "connected":
+        st.warning(
+            "🔑 **Gemini API Key Required:** Please configure `GEMINI_API_KEY` in your `.env` file or Streamlit Cloud Secrets to enable real AI conversational responses. "
+            "(Get a free key at [aistudio.google.com](https://aistudio.google.com)). Local commands like `add task: ...` and `remember: ...` work without an API key."
         )
 
-    # 3. Load Thread Messages from SQLite for active user
+    # 4. Message History Rendering
     thread_messages = get_thread_messages(active_th["id"], user_id=active_user_id)
 
-    # Empty State: ChatGPT-style welcome cards
     if not thread_messages:
         st.markdown(
             """
-            <div style="text-align: center; padding: 40px 16px 20px 16px;">
-                <div style="font-size: 3rem; margin-bottom: 6px;">🌌</div>
-                <h2 style="color: #f8fafc; margin-bottom: 6px; font-weight: 700;">How can NOVA help you today?</h2>
-                <p style="color: #94a3b8; font-size: 0.95rem; max-width: 600px; margin: 0 auto 24px auto;">
-                    Explore machine learning, organize academic priorities, store persistent knowledge, or run natural commands.
+            <div style="text-align: center; padding: 48px 16px 24px 16px;">
+                <div style="font-size: 2.8rem; margin-bottom: 8px;">🌌</div>
+                <h2 style="color: #f8fafc; margin-bottom: 6px; font-weight: 600; font-size: 1.5rem;">Hi! I'm NOVA. How can I help you today?</h2>
+                <p style="color: #94a3b8; font-size: 0.95rem; max-width: 480px; margin: 0 auto;">
+                    Chat casually, ask questions, explore ideas, or check latest news.
                 </p>
             </div>
             """,
             unsafe_allow_html=True,
         )
-
-        s_col1, s_col2 = st.columns(2)
-        with s_col1:
-            if st.button("💡 **Explain Machine Learning Concepts**\n\n*Understand gradient descent & loss functions*", use_container_width=True):
-                st.session_state.pending_prompt = "Explain gradient descent, learning rates, and loss minimization in machine learning."
-                st.rerun()
-            if st.button("🧠 **Save Academic Memory**\n\n*Store thesis research topic in memory*", use_container_width=True):
-                st.session_state.pending_prompt = "remember: [Academic] My MSc thesis topic is Graph Neural Networks for Drug Discovery."
-                st.rerun()
-        with s_col2:
-            if st.button("📋 **Create Project Task**\n\n*Schedule assignment deadline with high priority*", use_container_width=True):
-                st.session_state.pending_prompt = "add task: Complete Deep Learning Assignment due 2026-11-15 priority High"
-                st.rerun()
-            if st.button("📊 **Productivity Status**\n\n*Inspect task completion & metrics*", use_container_width=True):
-                st.session_state.pending_prompt = "stats"
-                st.rerun()
     else:
-        # Display conversation messages
-        for idx, msg in enumerate(thread_messages):
+        for msg in thread_messages:
             with st.chat_message(msg["role"]):
-                if msg["role"] == "user":
-                    st.markdown(msg["content"])
-                else:
-                    meta = msg.get("metadata", {})
-                    if meta.get("mode") == "deep_research":
-                        src_count = len(meta.get("sources") or [])
-                        st.caption(f"🔬 Synthesized via Deep Research Mode ({src_count} sources consulted)")
-                    elif meta.get("mode") in ("web_grounded", "web_grounded_offline"):
-                        src_count = len(meta.get("sources") or [])
-                        st.caption(f"🌐 Grounded via Live Web Search & Verified Sources ({src_count} sources)")
-                    elif meta.get("tool_called"):
-                        st.caption(f"🔧 Tool Invoked: `{meta['tool_called']}` (Validated & Executed)")
-                    elif meta.get("mode") == "llm":
-                        st.caption(f"⚡ Generated by {meta.get('provider', '').upper()} (`{meta.get('model', '')}`)")
-                    elif meta.get("mode") == "fallback_rule_based":
-                        st.caption("⚠️ Rule-Based Fallback Engaged")
+                st.markdown(msg["content"])
 
-                    st.markdown(msg["content"])
+    # 5. Fixed Bottom Input Bar: Text box + Mic button + Send button
+    st.markdown("<div style='margin-top: 24px;'></div>", unsafe_allow_html=True)
 
-                    if meta.get("sources"):
-                        with st.expander(f"📚 View Verified Primary Sources ({len(meta['sources'])})", expanded=False):
-                            for s_i, src in enumerate(meta["sources"], 1):
-                                s_title = src.get("title") or src.get("domain") or "Web Source"
-                                s_url = src.get("url", "#")
-                                s_domain = src.get("domain", "")
-                                s_date = src.get("access_date") or src.get("published_date") or "Recent"
-                                st.markdown(f"**[{s_i}] [{s_title}]({s_url})** — `{s_domain}` *(Accessed: {s_date})*")
-                                if src.get("snippet"):
-                                    st.caption(src["snippet"][:220] + "...")
+    if "chat_composer_input" not in st.session_state:
+        st.session_state["chat_composer_input"] = ""
 
-                    # Turn Actions: Copy, Thumbs Up, Thumbs Down, Teach NOVA, Retry, and Read Aloud
-                    act_c1, act_c2, act_c3, act_c4, act_c5, act_c6 = st.columns([1.0, 0.6, 0.6, 1.2, 1.2, 1.2])
-                    with act_c1:
-                        with st.popover("📋 Copy", help="Copy response content"):
-                            st.code(msg["content"], language="markdown")
-                    with act_c2:
-                        if st.button("👍", key=f"fb_up_{msg['id']}", help="Mark response as helpful"):
-                            record_message_feedback(
-                                conversation_id=active_th["id"],
-                                rating="thumbs_up",
-                                message_id=msg["id"],
-                                is_approved_for_training=True,
-                            )
-                            st.toast("Feedback recorded: Helpful! 👍")
-                    with act_c3:
-                        if st.button("👎", key=f"fb_down_{msg['id']}", help="Mark response as unhelpful or incorrect"):
-                            record_message_feedback(
-                                conversation_id=active_th["id"],
-                                rating="thumbs_down",
-                                message_id=msg["id"],
-                                is_approved_for_training=True,
-                            )
-                            st.toast("Feedback recorded: Needs improvement. Click ✏️ Teach to submit a verified correction.")
-                    with act_c4:
-                        with st.popover("✏️ Teach", help="Submit a verified correction to teach NOVA"):
-                            st.caption("**Teach NOVA / Submit Verified Correction**")
-                            corr_prev_usr = next((m["content"] for m in reversed(thread_messages[:idx]) if m["role"] == "user"), "")
-                            with st.form(f"corr_form_{msg['id']}"):
-                                c_prompt = st.text_input("User Question / Prompt", value=corr_prev_usr)
-                                c_bad = st.text_area("NOVA's Current (Incorrect) Answer", value=msg["content"][:300], height=68)
-                                c_good = st.text_area("Verified / Desired Answer", placeholder="Enter the accurate, desired response...", height=90)
-                                c_expl = st.text_input("Explanation / Rationale (Optional)", placeholder="e.g. In Python 3.10+, match-case was added")
-                                c_cat = st.selectbox("Category", ["Correction", "Demonstration", "Academic", "Code", "Identity", "Preferences"], index=0)
-                                c_consent = st.checkbox("Approve this correction for NOVA's self-learning store", value=True)
-                                if st.form_submit_button("💾 Save Correction", type="primary"):
-                                    if not c_prompt.strip() or not c_good.strip():
-                                        st.error("Prompt and verified answer cannot be empty.")
-                                    else:
-                                        record_correction(
-                                            user_prompt=c_prompt,
-                                            corrected_response=c_good,
-                                            rejected_response=c_bad,
-                                            explanation=c_expl,
-                                            category=c_cat,
-                                            is_approved=c_consent,
-                                            source="user_correction",
-                                        )
-                                        record_message_feedback(
-                                            conversation_id=active_th["id"],
-                                            rating="thumbs_down",
-                                            message_id=msg["id"],
-                                            feedback_text=f"Corrected: {c_good[:100]}",
-                                            is_approved_for_training=c_consent,
-                                        )
-                                        st.toast("✅ Correction saved! NOVA will retrieve this approved knowledge in future queries.")
-                                        st.rerun()
-                    with act_c5:
-                        # Offer retry on the last assistant response
-                        if idx == len(thread_messages) - 1:
-                            prev_usr = next((m["content"] for m in reversed(thread_messages[:idx]) if m["role"] == "user"), None)
-                            if prev_usr:
-                                if st.button("🔄 Retry", key=f"retry_{msg['id']}", help="Regenerate this turn"):
-                                    st.session_state.pending_prompt = prev_usr
-                                    st.rerun()
-                    with act_c6:
-                        if st.button("🔊 Read", key=f"speak_{msg['id']}", help="Read this response aloud"):
-                            st.session_state[f"play_audio_{msg['id']}"] = True
+    def handle_submit():
+        val = st.session_state.get("chat_composer_input", "").strip()
+        if val:
+            st.session_state["pending_chat_prompt"] = val
+            st.session_state["chat_composer_input"] = ""
 
-                    if st.session_state.get(f"play_audio_{msg['id']}"):
-                        with st.spinner("🔊 Generating spoken audio..."):
-                            curr_v_lang = st.session_state.get("voice_lang_code", "en-IN")
-                            aud_lang = "ta" if curr_v_lang in ("ta-IN", "ta") else "en"
-                            aud_tld = "co.in" if curr_v_lang in ("en-IN", "ta-IN", "tanglish") else "com"
-                            msg_tts = synthesize_speech(msg["content"], lang=aud_lang, tld=aud_tld)
-                            if msg_tts.get("success") and msg_tts.get("audio_bytes"):
-                                st.audio(msg_tts["audio_bytes"], format="audio/mp3", autoplay=True)
+    comp_c1, comp_c2, comp_c3 = st.columns([5.5, 1.3, 1.0], vertical_alignment="bottom")
 
-    # -------------------------------------------------------------------------
-    # 4. ChatGPT-Style Intelligence & Voice Controls Bar
-    # -------------------------------------------------------------------------
-    ctrl_col1, ctrl_col2, ctrl_col3, ctrl_col4 = st.columns([1.7, 1.7, 1.4, 1.6])
-    with ctrl_col1:
-        web_search_choice = st.selectbox(
-            "🌐 Web Search",
-            options=["Auto (Smart Routing)", "Always On (Force Web Search)", "Always Off (Reasoning Only)"],
-            index=0,
-            key="chat_web_search_mode_select",
-            help="Auto: Automatically searches the live internet when fresh information, documentation, news, or external data is needed. Off: Restricts to internal reasoning, math, and general knowledge.",
+    with comp_c1:
+        st.text_input(
+            "Message NOVA...",
+            key="chat_composer_input",
+            on_change=handle_submit,
+            placeholder="Message NOVA or speak into the mic...",
+            label_visibility="collapsed",
         )
-        web_mode_map = {
-            "Auto (Smart Routing)": "auto",
-            "Always On (Force Web Search)": "on",
-            "Always Off (Reasoning Only)": "off",
-        }
-        active_web_mode = web_mode_map.get(web_search_choice, "auto")
 
-    with ctrl_col2:
-        deep_research_enabled = st.checkbox(
-            "🔬 Deep Research Mode",
-            value=st.session_state.get("chat_deep_research_enabled", False),
-            key="chat_deep_research_toggle",
-            help="Multi-step investigation: breaks query into multiple angles, searches across sources, reads full pages, and synthesizes a comprehensive research report.",
+    with comp_c2:
+        mic_audio = st.audio_input(
+            "Speak",
+            key="chat_mic_widget",
+            label_visibility="collapsed",
+            help="Click to speak. Converts your voice to text directly in the message box.",
         )
-        st.session_state.chat_deep_research_enabled = deep_research_enabled
 
-    with ctrl_col3:
-        voice_tts_enabled = st.checkbox(
-            "🔊 Voice Replies (TTS)",
-            value=st.session_state.get("voice_tts_enabled", True),
-            key="chat_tts_toggle",
-            help="When enabled, NOVA reads out answers using natural speech synthesis.",
+    with comp_c3:
+        st.button(
+            "🚀 Send",
+            key="chat_send_btn",
+            on_click=handle_submit,
+            type="primary",
+            use_container_width=True,
         )
-        st.session_state.voice_tts_enabled = voice_tts_enabled
 
-    with ctrl_col4:
-        with st.popover("⚙️ Voice & Speech Settings", help="Configure speech recognition dialect, engine, and voice options"):
-            st.markdown("#### 🎙️ Voice & Audio Settings")
-            chat_lang_label = st.selectbox(
-                "🗣️ Speech Language",
-                options=[
-                    "English (India) [en-IN] — Recommended for Indian Accents",
-                    "Tamil / தமிழ் [ta-IN] — Native Tamil Speech",
-                    "Tanglish (Tamil + English Mixed)",
-                    "English (US) [en-US] — Standard American English",
-                ],
-                index=0,
-                key="chat_voice_language_select",
-                help="Select your spoken dialect. en-IN is calibrated for Indian English rhythm, cadence, and pronunciations.",
-            )
-            lang_map = {
-                "English (India) [en-IN] — Recommended for Indian Accents": "en-IN",
-                "Tamil / தமிழ் [ta-IN] — Native Tamil Speech": "ta-IN",
-                "Tanglish (Tamil + English Mixed)": "tanglish",
-                "English (US) [en-US] — Standard American English": "en-US",
-            }
-            selected_lang_code = lang_map.get(chat_lang_label, "en-IN")
-            st.session_state.voice_lang_code = selected_lang_code
-
-            chat_engine_label = st.selectbox(
-                "⚙️ Recognition Engine",
-                options=[
-                    "Auto (Gemini 1.5 Flash if available, else Google Web Speech)",
-                    "Google Web Speech (Free $0.00, Zero API Key Required)",
-                    "Google Gemini 1.5 Flash (Multimodal Audio, Best for Tanglish)",
-                ],
-                index=0,
-                key="chat_voice_engine_select",
-                help="Auto uses Gemini 1.5 Flash when GEMINI_API_KEY is present, and falls back to Google Web Speech.",
-            )
-            engine_map = {
-                "Auto (Gemini 1.5 Flash if available, else Google Web Speech)": "auto",
-                "Google Web Speech (Free $0.00, Zero API Key Required)": "google",
-                "Google Gemini 1.5 Flash (Multimodal Audio, Best for Tanglish)": "gemini",
-            }
-            selected_engine = engine_map.get(chat_engine_label, "auto")
-            st.session_state.voice_engine = selected_engine
-
-            voice_consent = st.checkbox(
-                "Consent to external audio processing (Google / Gemini)",
-                value=st.session_state.get("voice_consent", True),
-                key="chat_consent_checkbox",
-            )
-            st.session_state.voice_consent = voice_consent
-
-            voice_autoplay = st.checkbox(
-                "▶️ Auto-play spoken responses",
-                value=st.session_state.get("voice_autoplay", False),
-                key="chat_autoplay_checkbox",
-            )
-            st.session_state.voice_autoplay = voice_autoplay
-
-            st.markdown(
-                """
-                <div style="font-size: 0.8rem; color: #94a3b8; margin-top: 8px; line-height: 1.4;">
-                    🔒 <b>Privacy:</b> Voice input is strictly user-initiated. Audio snippets are sent over encrypted HTTPS and discarded immediately. Zero continuous background recording.
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-    # -------------------------------------------------------------------------
-    # 5. UNIFIED MESSAGE COMPOSER (Text Input, Send, Mic, Recording Status & Stop)
-    # -------------------------------------------------------------------------
-    st.markdown("<div style='margin-top: 14px;'></div>", unsafe_allow_html=True)
-
-    # Check for pending prompt (e.g. from Retry button or suggestion pills)
-    if st.session_state.get("pending_prompt"):
-        st.session_state.chat_composer_text = st.session_state.pop("pending_prompt")
-
-    # Microphone recording and voice-to-text handling
-    mic_audio = st.audio_input(
-        "🎙️ Speak to NOVA (Click mic to record; live waveform, timer & stop button appear while speaking)",
-        key="unified_chat_mic_widget",
-        help="Click the microphone to start speaking. Click the stop button when done to transcribe your speech directly into the message box below.",
-    )
-
+    # Convert voice input into text in the message input box
     if mic_audio is not None:
         raw_audio_bytes = mic_audio.getvalue()
         audio_md5 = hashlib.md5(raw_audio_bytes).hexdigest()
 
-        # Check if this is a new recording that hasn't been transcribed yet
         if st.session_state.get("chat_stt_audio_hash") != audio_md5:
-            if not st.session_state.get("voice_consent", True):
-                st.warning("⚠️ External audio processing consent is required for voice recognition. Please enable consent in ⚙️ Voice & Speech Settings above.")
-            elif len(raw_audio_bytes) < 200:
-                st.warning("⚠️ Recording empty or too short. Please speak clearly into your microphone.")
+            st.session_state["chat_stt_audio_hash"] = audio_md5
+            if len(raw_audio_bytes) < 200:
+                st.toast("⚠️ Audio was empty or too quiet. Please speak clearly into your microphone.", icon="🎙️")
             else:
-                active_lang = st.session_state.get("voice_lang_code", "en-IN")
-                active_eng = st.session_state.get("voice_engine", "auto")
-                with st.spinner(f"🎧 Converting your speech to text ({active_lang})..."):
+                with st.spinner("Listening & transcribing..."):
                     stt_result = transcribe_audio(
                         raw_audio_bytes,
                         audio_format="wav",
-                        language=active_lang,
-                        engine=active_eng,
+                        language=st.session_state.get("voice_lang_code", "en-IN"),
+                        engine="auto",
                         consent_external=True,
                     )
-
-                if stt_result.get("success"):
-                    st.session_state.chat_stt_audio_hash = audio_md5
-                    st.session_state.chat_composer_text = stt_result["text"]
-                    st.session_state.voice_just_transcribed = True
-                    st.session_state.last_stt_meta = stt_result
-                    record_activity("voice_transcription", metadata=f"Transcribed: {stt_result['text'][:40]}")
+                if stt_result.get("success") and stt_result.get("text"):
+                    st.session_state["chat_composer_input"] = stt_result["text"]
+                    st.toast("Voice recognized! You can review or send your message.", icon="✨")
                     st.rerun()
                 else:
-                    st.error(f"❌ Speech Recognition Notice: {stt_result.get('error')}")
-                    if stt_result.get("error_type") in ("silence", "unknown_audio"):
-                        st.info(
-                            "💡 **Microphone Troubleshooting Tips:**\n"
-                            "- Check your browser's microphone permissions (lock/settings icon in the address bar).\n"
-                            "- Verify your microphone is connected and unmuted in Windows Sound Settings.\n"
-                            "- Speak closer to the microphone with clear articulation."
-                        )
+                    err_txt = stt_result.get("error") or "Could not recognize speech."
+                    st.toast(f"Speech recognition notice: {err_txt}", icon="🎙️")
 
-    # Status notification if speech was transcribed: allows review & editing
-    if st.session_state.get("voice_just_transcribed") and st.session_state.get("chat_composer_text"):
-        trans_meta = st.session_state.get("last_stt_meta", {})
-        eng_used = trans_meta.get("engine_used", "speech recognition")
-        lang_used = trans_meta.get("language_used", st.session_state.get("voice_lang_code", "en-IN"))
-        
-        stat_c1, stat_c2 = st.columns([5.2, 1])
-        with stat_c1:
-            st.markdown(
-                f"<div style='font-size: 0.85rem; color: #10b981; padding: 6px 12px; background: rgba(16, 185, 129, 0.1); border-radius: 8px; border: 1px solid rgba(16, 185, 129, 0.25); margin-bottom: 6px;'>"
-                f"🟢 <b>Speech Recognized via {eng_used} ({lang_used}):</b> Review or edit your message in the input box below, then click <b>🚀 Send</b> or press Enter."
-                f"</div>",
-                unsafe_allow_html=True,
-            )
-        with stat_c2:
-            if st.button("🗑️ Discard", key="btn_discard_transcribed_audio", help="Discard recognized speech"):
-                st.session_state.chat_composer_text = ""
-                st.session_state.voice_just_transcribed = False
-                st.rerun()
-
-    # Unified Message Input Box & Send Form
-    user_prompt = None
-    with st.form(key="unified_chat_composer_form", clear_on_submit=False):
-        comp_f1, comp_f2 = st.columns([5.3, 1])
-        with comp_f1:
-            typed_message = st.text_input(
-                "Message NOVA...",
-                value=st.session_state.get("chat_composer_text", ""),
-                key="unified_chat_text_input",
-                placeholder="Ask NOVA anything, speak using the microphone above, or edit your voice transcript...",
-                label_visibility="collapsed",
-            )
-        with comp_f2:
-            send_clicked = st.form_submit_button("🚀 Send", use_container_width=True)
-
-    if send_clicked:
-        clean_text = typed_message.strip()
-        if not clean_text:
-            st.warning("⚠️ Please enter a question or click the microphone to speak.")
-        else:
-            user_prompt = clean_text
-            st.session_state.chat_composer_text = ""
-            st.session_state.voice_just_transcribed = False
-
-    # -------------------------------------------------------------------------
-    # 6. Stream Assistant Turn in the Unified Conversation
-    # -------------------------------------------------------------------------
-    if user_prompt:
-        # Display user question in the single chat history
+    # 6. Stream Assistant Response in Unified Pipeline
+    prompt_to_run = st.session_state.pop("pending_chat_prompt", None)
+    if prompt_to_run:
         with st.chat_message("user"):
-            st.markdown(user_prompt)
+            st.markdown(prompt_to_run)
 
-        # Stream assistant response through the unified AI pipeline
+        assistant = NovaAssistant()
+        is_tool = assistant._is_explicit_tool_command(prompt_to_run)
+
         with st.chat_message("assistant"):
-            assistant = NovaAssistant()
-            if deep_research_enabled:
-                spinner_msg = "🔬 Conducting Deep Research & synthesizing multi-source findings..."
-            elif active_web_mode == "on":
-                spinner_msg = "🌐 Searching live internet & reading sources..."
-            else:
-                spinner_msg = "NOVA is reasoning..."
-
-            with st.spinner(spinner_msg):
-                stream_generator = assistant.process_message_stream(
-                    user_prompt,
-                    conversation_id=active_th["id"],
-                    user_id=active_user_id,
-                    web_search=active_web_mode,
-                    deep_research=deep_research_enabled,
+            if not is_llm_configured() and not is_tool:
+                config_err = (
+                    "⚠️ **Gemini API Key Required**\n\n"
+                    "To chat with NOVA and receive real AI answers, please configure your free Gemini API key:\n\n"
+                    "1. Get a free key at [aistudio.google.com](https://aistudio.google.com) (no credit card required).\n"
+                    "2. Add `GEMINI_API_KEY = \"AIza...\"` to your `.env` file or Streamlit Cloud Secrets.\n\n"
+                    "*Local commands like `add task: ...`, `show tasks`, and `remember: ...` work without an API key.*"
                 )
-                full_reply = st.write_stream(stream_generator)
-
-        # Natural Spoken Speech Synthesis (TTS) when enabled
-        if st.session_state.get("voice_tts_enabled", True):
-            with st.spinner("🔊 Generating natural spoken voice response..."):
-                active_v_lang = st.session_state.get("voice_lang_code", "en-IN")
-                tts_lang = "ta" if active_v_lang in ("ta-IN", "ta") else "en"
-                tts_tld = "co.in" if active_v_lang in ("en-IN", "ta-IN", "tanglish") else "com"
-                tts_res = synthesize_speech(full_reply, lang=tts_lang, tld=tts_tld)
-                if tts_res.get("success") and tts_res.get("audio_bytes"):
-                    st.markdown("**🔊 Spoken Audio Response:**")
-                    st.audio(
-                        tts_res["audio_bytes"],
-                        format="audio/mp3",
-                        autoplay=st.session_state.get("voice_autoplay", False),
-                    )
-                    st.download_button(
-                        "💾 Download Voice Audio (.mp3)",
-                        data=tts_res["audio_bytes"],
-                        file_name=f"nova_reply_{int(datetime.now().timestamp())}.mp3",
-                        mime="audio/mp3",
-                        key="dl_reply_tts_audio",
-                    )
-
+                st.markdown(config_err)
+                add_message(active_th["id"], "user", prompt_to_run, user_id=active_user_id)
+                add_message(active_th["id"], "assistant", config_err, metadata={"mode": "configuration_error"}, user_id=active_user_id)
+            else:
+                with st.spinner("NOVA is thinking..."):
+                    try:
+                        stream_gen = assistant.process_message_stream(
+                            prompt_to_run,
+                            conversation_id=active_th["id"],
+                            user_id=active_user_id,
+                            web_search="auto",
+                            deep_research=False,
+                        )
+                        st.write_stream(stream_gen)
+                    except Exception as e:
+                        st.error(f"Sorry, I encountered an issue generating an answer: {e}")
         st.rerun()
 
-    # -------------------------------------------------------------------------
-    # 7. NOVA Voice Intelligence Studio & Audio Laboratory Expander
-    # -------------------------------------------------------------------------
-    st.markdown("<div style='margin-top: 24px;'></div>", unsafe_allow_html=True)
-    with st.expander("🎙️ NOVA Voice Intelligence Studio & Audio Laboratory", expanded=False):
-        st.markdown(
-            """
-            <div style="font-size: 0.88rem; color: #94a3b8; margin-bottom: 12px; line-height: 1.5;">
-                Advanced acoustic diagnostics, engine benchmarks, and text-to-speech laboratory. Test speech recognition accuracy, inspect RMS energy, and audition custom voices across accents.
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        # Voice Diagnostics & Capabilities
-        v_stat = get_voice_status()
-        vc1, vc2, vc3 = st.columns(3)
-        with vc1:
-            st.markdown(
-                f"""
-                <div class="nova-metric-card">
-                    <div class="nova-metric-label">Speech-to-Text (STT)</div>
-                    <div style="font-size: 1.05rem; font-weight: 700; color: #22d3ee; margin-top: 6px;">
-                        {v_stat['stt_name']}
-                    </div>
-                    <div style="font-size: 0.75rem; color: #10b981; margin-top: 4px;">{v_stat['stt_cost']}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-        with vc2:
-            st.markdown(
-                f"""
-                <div class="nova-metric-card">
-                    <div class="nova-metric-label">Text-to-Speech (TTS)</div>
-                    <div style="font-size: 1.05rem; font-weight: 700; color: #c084fc; margin-top: 6px;">
-                        {v_stat['tts_name']}
-                    </div>
-                    <div style="font-size: 0.75rem; color: #10b981; margin-top: 4px;">{v_stat['tts_cost']}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-        with vc3:
-            st.markdown(
-                """
-                <div class="nova-metric-card">
-                    <div class="nova-metric-label">Voice Privacy & Recording</div>
-                    <div style="font-size: 1.05rem; font-weight: 700; color: #38bdf8; margin-top: 6px;">
-                        User-Initiated Only
-                    </div>
-                    <div style="font-size: 0.75rem; color: #94a3b8; margin-top: 4px;">No continuous background recording</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        st.info(
-            "🔒 **Voice Privacy Disclosure & Architecture:**\n\n"
-            "- **Microphone Recording:** Activated ONLY when you explicitly press the Record button in your browser.\n"
-            "- **Speech-to-Text Transit:** Audio snippets are sent over encrypted HTTPS for transcription and discarded immediately.\n"
-            "- **Text-to-Speech Transit:** Text output is synthesized via Google Text-to-Speech (`gTTS`) into MP3 audio.\n"
-            "- **Data Sovereignty:** No voice recordings are permanently kept or tied to personal profiles. $0.00 cost architecture."
-        )
-
-        lab_tab1, lab_tab2 = st.tabs([
-            "🎙️ Speech-to-Text Laboratory (STT)",
-            "🔊 Text-to-Speech Laboratory (TTS)",
-        ])
-
-        with lab_tab1:
-            st.subheader("🎙️ Speech-to-Text Acoustic Diagnostics")
-            st.caption("Test speech transcription independently to analyze acoustic accuracy, RMS energy levels, and phonetics.")
-
-            lab_c1, lab_c2 = st.columns(2)
-            with lab_c1:
-                stt_lab_lang_label = st.selectbox(
-                    "🗣️ Test Language",
-                    options=[
-                        "English (India) [en-IN] — Recommended",
-                        "Tamil / தமிழ் [ta-IN]",
-                        "Tanglish (Tamil + English Mixed)",
-                        "English (US) [en-US]",
-                    ],
-                    index=0,
-                    key="stt_lab_lang_select",
-                )
-                lab_lang_map = {
-                    "English (India) [en-IN] — Recommended": "en-IN",
-                    "Tamil / தமிழ் [ta-IN]": "ta-IN",
-                    "Tanglish (Tamil + English Mixed)": "tanglish",
-                    "English (US) [en-US]": "en-US",
-                }
-                active_lab_lang = lab_lang_map.get(stt_lab_lang_label, "en-IN")
-
-            with lab_c2:
-                stt_lab_engine_label = st.selectbox(
-                    "⚙️ Test Engine",
-                    options=[
-                        "Auto (Gemini 1.5 Flash if available, else Google)",
-                        "Google Web Speech (Free $0.00)",
-                        "Google Gemini 1.5 Flash (Multimodal)",
-                    ],
-                    index=0,
-                    key="stt_lab_engine_select",
-                )
-                lab_engine_map = {
-                    "Auto (Gemini 1.5 Flash if available, else Google)": "auto",
-                    "Google Web Speech (Free $0.00)": "google",
-                    "Google Gemini 1.5 Flash (Multimodal)": "gemini",
-                }
-                active_lab_engine = lab_engine_map.get(stt_lab_engine_label, "auto")
-
-            st.write("Record any test phrase below:")
-            stt_test_audio = st.audio_input("Record speech sample", key="stt_lab_recorder")
-
-            if stt_test_audio is not None:
-                stt_bytes = stt_test_audio.getvalue()
-                rms_energy = calculate_pcm_rms(stt_bytes)
-                audio_size_kb = len(stt_bytes) / 1024
-
-                st.write(f"- **Captured Audio Size:** `{audio_size_kb:.2f} KB`")
-                st.write(f"- **Audio Container:** WAV (16kHz PCM mono)")
-                st.write(f"- **Calculated Audio Energy (RMS):** `{rms_energy:.1f}` {'🟢 (Good Signal)' if rms_energy > 200 else '🟡 (Quiet / Low Volume)' if rms_energy > 50 else '🔴 (Silent / Mic Muted)'}")
-
-                if st.button("🚀 Transcribe Audio Sample", key="btn_run_stt_lab"):
-                    with st.spinner(f"Transcribing using {active_lab_engine} ({active_lab_lang})..."):
-                        lab_res = transcribe_audio(
-                            stt_bytes,
-                            language=active_lab_lang,
-                            engine=active_lab_engine,
-                            consent_external=True,
-                        )
-
-                    if lab_res["success"]:
-                        st.success("✅ **Transcription Successful!**")
-                        st.text_area("Recognized Text:", value=lab_res["text"], height=100)
-                        st.caption(
-                            f"Engine: `{lab_res['engine_used']}` | "
-                            f"Language Tag: `{lab_res['language_used']}` | "
-                            f"Word Count: {len(lab_res['text'].split())} | "
-                            f"Character Count: {len(lab_res['text'])}"
-                        )
-                    else:
-                        st.error(f"❌ Transcription Failed: {lab_res['error']} (Type: `{lab_res['error_type']}`)")
-                        if lab_res.get("error_type") == "silence":
-                            st.info("💡 The audio signal was silent. Check that your microphone is unmuted and the input volume is high enough.")
-
-        with lab_tab2:
-            st.subheader("🔊 Text-to-Speech Laboratory (TTS)")
-            st.caption("Synthesize custom text into natural speech with language detection and accent normalization.")
-
-            preset = st.selectbox(
-                "Load Sample Sentence",
-                [
-                    "Custom Text (Type below)",
-                    "English: NOVA Assistant Intro",
-                    "Tamil: நோவா வரவேற்பு உரை (Greeting)",
-                    "Tanglish: Study Schedule Reminder",
-                ],
-                index=0,
-                key="tts_sample_preset",
-            )
-
-            preset_texts = {
-                "English: NOVA Assistant Intro": (
-                    "Hello! I am NOVA, your personal AI assistant. "
-                    "I can track your tasks, manage study schedules, and process research documents."
-                ),
-                "Tamil: நோவா வரவேற்பு உரை (Greeting)": (
-                    "வணக்கம்! நான் நோவா, உங்கள் தனிப்பட்ட AI உதவியாளர். "
-                    "உங்கள் பணிகள், நினைவூட்டல்கள் மற்றும் படிப்பு அட்டவணையை நிர்வகிக்க நான் உதவுகிறேன்."
-                ),
-                "Tanglish: Study Schedule Reminder": (
-                    "Hello! Innaiku enna study plan irukku? "
-                    "Unga AI assignments and data science tasks ellam ready-ah irukku."
-                ),
-            }
-
-            default_text = preset_texts.get(preset, "Hello! I am NOVA, your personal AI assistant.")
-            sample_prompt = st.text_area(
-                "Text to Synthesize",
-                value=default_text,
-                height=120,
-                key="tts_lab_textarea",
-            )
-
-            tts_c1, tts_c2 = st.columns(2)
-            with tts_c1:
-                tts_accent = st.selectbox(
-                    "Voice Language / Accent",
-                    [
-                        "English (India) — co.in",
-                        "Tamil (தமிழ்) — Native Tamil",
-                        "English (US) — com",
-                        "English (UK) — co.uk",
-                        "English (Australia) — com.au",
-                    ],
-                    index=0,
-                    key="tts_lab_accent_select",
-                )
-                if "Tamil" in tts_accent:
-                    tts_lab_lang = "ta"
-                    tts_lab_tld = "com"
-                else:
-                    tts_lab_lang = "en"
-                    accent_tld_map = {
-                        "English (India) — co.in": "co.in",
-                        "English (US) — com": "com",
-                        "English (UK) — co.uk": "co.uk",
-                        "English (Australia) — com.au": "com.au",
-                    }
-                    tts_lab_tld = accent_tld_map.get(tts_accent, "co.in")
-
-            with tts_c2:
-                tts_speed = st.checkbox("Slow Speed (Educational / Dictation mode)", value=False)
-
-            if st.button("🔊 Synthesize & Play Speech", key="btn_run_tts_lab"):
-                with st.spinner("Synthesizing speech with gTTS..."):
-                    t_lab_res = synthesize_speech(
-                        sample_prompt,
-                        lang=tts_lab_lang,
-                        tld=tts_lab_tld,
-                        slow=tts_speed,
-                    )
-
-                if t_lab_res["success"]:
-                    st.success("✅ **Speech Generated Successfully!**")
-                    st.write("**Cleaned Spoken Transcript:**")
-                    st.caption(f"\"{t_lab_res['cleaned_text']}\"")
-                    st.caption(f"Language: `{t_lab_res.get('language_used', tts_lab_lang)}` | Regional TLD: `{tts_lab_tld}`")
-                    st.audio(t_lab_res["audio_bytes"], format="audio/mp3", autoplay=True)
-                    st.download_button(
-                        "💾 Download MP3 Audio",
-                        data=t_lab_res["audio_bytes"],
-                        file_name="nova_custom_speech.mp3",
-                        mime="audio/mp3",
-                        key="dl_custom_tts",
-                    )
-                else:
-                    st.error(f"❌ Synthesis Failed: {t_lab_res['error']}")
 
 
 # -----------------------------------------------------------------------------
@@ -3520,14 +2994,82 @@ elif selected_page == "⚙️ Settings":
             st.write("- **Domain Extraction:** Verified primary source URLs with direct markdown citations")
 
         st.markdown("---")
+        st.markdown("#### 🔑 Gemini API Key Configuration")
+        active_key = get_gemini_api_key()
+        if active_key:
+            st.success(f"✅ **Gemini API Key Active**: `{_mask_key(active_key)}` — Connected to `{llm_stat.get('model', 'gemini-1.5-flash')}`")
+        else:
+            st.warning("🟠 **Gemini API Key Not Configured**: Enter your key below or add `GEMINI_API_KEY` to your `.env` file or Streamlit Cloud Secrets.")
+
+        new_key = st.text_input(
+            "Configure Gemini API Key:",
+            value="",
+            type="password",
+            placeholder="Paste your AIzaSy... key here",
+            key="settings_gemini_key_input",
+            help="Free key from aistudio.google.com. Stored securely on your local machine and never committed to Git.",
+        )
+
+        key_col1, key_col2 = st.columns([1, 1])
+        with key_col1:
+            if st.button("💾 Save Key", key="btn_save_gemini_key_settings", type="primary", use_container_width=True):
+                clean_k = new_key.strip()
+                if clean_k:
+                    st.session_state["user_gemini_api_key"] = clean_k
+                    # Update local .env file safely
+                    env_p = PROJECT_ROOT / ".env"
+                    lines = []
+                    if env_p.exists():
+                        with open(env_p, "r", encoding="utf-8") as f:
+                            lines = f.readlines()
+                    found = False
+                    new_lines = []
+                    for line in lines:
+                        if line.strip().startswith("GEMINI_API_KEY="):
+                            new_lines.append(f"GEMINI_API_KEY={clean_k}\n")
+                            found = True
+                        else:
+                            new_lines.append(line)
+                    if not found:
+                        new_lines.append(f"\nGEMINI_API_KEY={clean_k}\n")
+                    with open(env_p, "w", encoding="utf-8") as f:
+                        f.writelines(new_lines)
+                    st.toast("✅ Gemini API Key saved to .env and active session!", icon="🔑")
+                    st.rerun()
+                else:
+                    st.error("Please enter a valid key.")
+
+        with key_col2:
+            if st.button("🧪 Test Key Connection", key="btn_test_gemini_key_settings", use_container_width=True):
+                target_key = new_key.strip() or active_key
+                if not target_key:
+                    st.error("No API key available to test. Please enter a key above.")
+                else:
+                    with st.spinner("Verifying key with Google Gemini API..."):
+                        val_res = validate_gemini_key(target_key)
+                    if val_res["valid"]:
+                        st.success(f"✅ {val_res['message']}")
+                    else:
+                        st.error(f"❌ Verification failed: {val_res['message']}")
+
+        st.markdown("---")
         st.markdown(
             """
-            #### 🔑 Setting Up Your Free Gemini API Key
-            NOVA runs 100% locally with zero required subscription fees. To connect Google Gemini:
-            1. Visit **[Google AI Studio](https://aistudio.google.com/)** and create a free API key (zero cost, 15 RPM).
-            2. Open the `.env` file in the NOVA project directory.
-            3. Add `GEMINI_API_KEY=AIzaSy...` and save.
-            4. Restart NOVA. Your key is stored strictly on your local machine and never committed to Git.
+            #### 📋 Deployment & Configuration Guide
+            NOVA supports both local and cloud deployment:
+            - **Local Development (`.env` file):**
+              Create or edit `.env` in the project root:
+              ```env
+              GEMINI_API_KEY=AIzaSy...
+              GEMINI_MODEL=gemini-1.5-flash
+              LLM_PROVIDER=gemini
+              ```
+            - **Streamlit Community Cloud (`secrets.toml`):**
+              In your Streamlit Cloud app settings under **Secrets**, add:
+              ```toml
+              GEMINI_API_KEY = "AIzaSy..."
+              ```
+            - **Google AI Studio:** Get a free API key (zero cost, 15 RPM, 1,500 RPD) at **[aistudio.google.com](https://aistudio.google.com/)**.
             """
         )
 

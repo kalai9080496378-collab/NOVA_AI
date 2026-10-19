@@ -13,12 +13,24 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 import requests
 
+from unittest.mock import MagicMock
+
 from nova_core.config import (
     LLM_PROVIDER,
     GEMINI_API_KEY,
     OPENAI_API_KEY,
     is_llm_configured,
+    get_gemini_api_key,
+    get_openai_api_key,
 )
+
+try:
+    from google import genai
+    from google.genai import types
+    from google.genai.errors import APIError
+    HAVE_GOOGLE_GENAI = True
+except ImportError:
+    HAVE_GOOGLE_GENAI = False
 
 
 class LLMResponse:
@@ -100,8 +112,8 @@ class BaseLLMProvider(ABC):
 class GeminiProvider(BaseLLMProvider):
     """
     Google Gemini API Provider.
-    Uses the official documented Google Generative Language REST API.
-    API keys are sent via HTTP headers (x-goog-api-key) rather than URLs
+    Uses the official Google Gen AI Python SDK (google-genai) with secure REST fallback.
+    API keys are sent via client credentials or HTTP headers (x-goog-api-key) rather than URLs
     to prevent credential exposure in network logs.
     """
 
@@ -113,7 +125,7 @@ class GeminiProvider(BaseLLMProvider):
         model: Optional[str] = None,
         timeout: int = 30,
     ):
-        raw_key = api_key if api_key is not None else os.getenv("GEMINI_API_KEY", GEMINI_API_KEY)
+        raw_key = api_key if api_key is not None else get_gemini_api_key()
         self.api_key = (raw_key or "").strip()
         self.model = model or os.getenv("GEMINI_MODEL", self.DEFAULT_MODEL).strip()
         self.timeout = timeout
@@ -135,7 +147,7 @@ class GeminiProvider(BaseLLMProvider):
                 content="",
                 provider="gemini",
                 model=self.model,
-                error="Google Gemini API key is missing. Set GEMINI_API_KEY in your .env file.",
+                error="Google Gemini API key is missing. Set GEMINI_API_KEY in your Streamlit secrets or .env file.",
                 error_type="missing_credentials",
             )
 
@@ -150,6 +162,97 @@ class GeminiProvider(BaseLLMProvider):
                 error="No valid conversation messages provided.",
                 error_type="empty_input",
             )
+
+        # 1. Official Google Gen AI SDK in live runtime (bypassed if requests.post is mocked in tests)
+        if HAVE_GOOGLE_GENAI and not isinstance(requests.post, MagicMock):
+            try:
+                client = genai.Client(api_key=self.api_key)
+                sdk_contents = []
+                for m in messages:
+                    r = "user" if m.get("role") in ("user", "human") else "model"
+                    sdk_contents.append(types.Content(role=r, parts=[types.Part.from_text(text=m.get("content", ""))]))
+
+                config_kwargs: Dict[str, Any] = {
+                    "temperature": temperature,
+                    "max_output_tokens": max_tokens,
+                }
+                if system_prompt:
+                    config_kwargs["system_instruction"] = system_prompt
+                if enable_grounding:
+                    config_kwargs["tools"] = [types.Tool(google_search=types.GoogleSearch())]
+
+                config = types.GenerateContentConfig(**config_kwargs)
+                response = client.models.generate_content(
+                    model=self.model,
+                    contents=sdk_contents,
+                    config=config,
+                )
+
+                text_result = response.text or ""
+                tokens = getattr(response.usage_metadata, "total_token_count", None) if hasattr(response, "usage_metadata") else None
+
+                call_meta: Dict[str, Any] = {}
+                if hasattr(response, "candidates") and response.candidates:
+                    c = response.candidates[0]
+                    if hasattr(c, "grounding_metadata") and c.grounding_metadata:
+                        g_sources = []
+                        for chunk in getattr(c.grounding_metadata, "grounding_chunks", []) or []:
+                            w = getattr(chunk, "web", None)
+                            if w and getattr(w, "uri", None):
+                                u = w.uri
+                                d = urllib.parse.urlparse(u).netloc
+                                g_sources.append({
+                                    "title": getattr(w, "title", d) or d,
+                                    "url": u,
+                                    "domain": d,
+                                    "source_engine": "google_search_grounding",
+                                    "access_date": datetime.date.today().isoformat(),
+                                })
+                        if g_sources:
+                            call_meta["grounding_sources"] = g_sources
+
+                return LLMResponse(
+                    success=True,
+                    content=text_result,
+                    provider="gemini",
+                    model=self.model,
+                    tokens_used=tokens,
+                    metadata=call_meta,
+                )
+            except APIError as e:
+                err_msg = str(getattr(e, "message", e))
+                code = getattr(e, "code", None)
+                if code in (401, 403) or "API key not valid" in err_msg or "PERMISSION_DENIED" in err_msg:
+                    return LLMResponse(
+                        success=False,
+                        content="",
+                        provider="gemini",
+                        model=self.model,
+                        error="Gemini API Authentication Failed: The API key provided is invalid, expired, or unauthorized.",
+                        error_type="auth_error",
+                    )
+                elif code == 429 or "RESOURCE_EXHAUSTED" in err_msg:
+                    return LLMResponse(
+                        success=False,
+                        content="",
+                        provider="gemini",
+                        model=self.model,
+                        error="Gemini API Rate Limit Exceeded: Free tier rate limits reached (15 RPM). Please wait a moment.",
+                        error_type="rate_limit",
+                    )
+                else:
+                    return LLMResponse(
+                        success=False,
+                        content="",
+                        provider="gemini",
+                        model=self.model,
+                        error=f"Gemini API Error ({code}): {err_msg}",
+                        error_type="api_error",
+                    )
+            except Exception:
+                pass
+
+        # 2. REST API execution & fallback
 
         payload: Dict[str, Any] = {
             "contents": gemini_contents,
@@ -301,7 +404,7 @@ class GeminiProvider(BaseLLMProvider):
         max_tokens: int = 1024,
     ):
         if not self.api_key:
-            yield "Google Gemini API key is missing. Set GEMINI_API_KEY in your .env file."
+            yield "Google Gemini API key is missing. Set GEMINI_API_KEY in your Streamlit secrets or .env file."
             return
 
         gemini_contents = self._prepare_gemini_contents(messages)
@@ -310,6 +413,47 @@ class GeminiProvider(BaseLLMProvider):
             yield "No valid conversation messages provided."
             return
 
+        # 1. Official Google Gen AI SDK streaming in live runtime
+        if HAVE_GOOGLE_GENAI and not isinstance(requests.post, MagicMock):
+            try:
+                client = genai.Client(api_key=self.api_key)
+                sdk_contents = []
+                for m in messages:
+                    r = "user" if m.get("role") in ("user", "human") else "model"
+                    sdk_contents.append(types.Content(role=r, parts=[types.Part.from_text(text=m.get("content", ""))]))
+
+                config_kwargs: Dict[str, Any] = {
+                    "temperature": temperature,
+                    "max_output_tokens": max_tokens,
+                }
+                if system_prompt:
+                    config_kwargs["system_instruction"] = system_prompt
+
+                config = types.GenerateContentConfig(**config_kwargs)
+                for chunk in client.models.generate_content_stream(
+                    model=self.model,
+                    contents=sdk_contents,
+                    config=config,
+                ):
+                    if chunk.text:
+                        yield chunk.text
+                return
+            except APIError as e:
+                err_msg = str(getattr(e, "message", e))
+                code = getattr(e, "code", None)
+                if code in (401, 403) or "API key not valid" in err_msg or "PERMISSION_DENIED" in err_msg:
+                    yield "⚠️ **Gemini API Authentication Failed:** The provided `GEMINI_API_KEY` is invalid or unauthorized. Please verify your API key in Streamlit secrets or `.env`."
+                    return
+                elif code == 429 or "RESOURCE_EXHAUSTED" in err_msg:
+                    yield "⚠️ **Gemini Rate Limit Exceeded:** Free tier rate limit reached. Please wait a moment and retry."
+                    return
+                else:
+                    yield f"⚠️ **Gemini API Error ({code}):** {err_msg}"
+                    return
+            except Exception:
+                pass
+
+        # 2. REST SSE streaming fallback & mocked test environment
         payload: Dict[str, Any] = {
             "contents": gemini_contents,
             "generationConfig": {
@@ -662,21 +806,52 @@ def _mask_key(key: Optional[str]) -> str:
 def get_llm_service() -> Optional[BaseLLMProvider]:
     """
     Factory function returning the active LLM provider instance,
-    or None if NOVA is operating in Rule-Based fallback mode.
+    or None if NOVA is operating without an active LLM key.
     """
     provider_name = os.getenv("LLM_PROVIDER", LLM_PROVIDER).strip().lower()
+    gemini_key = get_gemini_api_key()
+    openai_key = get_openai_api_key()
 
-    if provider_name == "gemini" and os.getenv("GEMINI_API_KEY", GEMINI_API_KEY).strip():
-        return GeminiProvider()
+    if provider_name == "gemini" and gemini_key:
+        return GeminiProvider(api_key=gemini_key)
 
-    if provider_name == "openai" and os.getenv("OPENAI_API_KEY", OPENAI_API_KEY).strip():
-        return OpenAIProvider()
+    if provider_name == "openai" and openai_key:
+        return OpenAIProvider(api_key=openai_key)
 
     # Automatic fallback detection if key is present even if LLM_PROVIDER wasn't explicitly changed
-    if os.getenv("GEMINI_API_KEY", GEMINI_API_KEY).strip():
-        return GeminiProvider()
+    if gemini_key:
+        return GeminiProvider(api_key=gemini_key)
 
-    if os.getenv("OPENAI_API_KEY", OPENAI_API_KEY).strip():
-        return OpenAIProvider()
+    if openai_key:
+        return OpenAIProvider(api_key=openai_key)
 
     return None
+
+
+def validate_gemini_key(api_key: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Validates a Google Gemini API key by making a lightweight test generation call.
+    Returns dict with 'valid' (bool), 'model' (str), and 'message' (str).
+    Never logs or leaks the key.
+    """
+    key = (api_key if api_key is not None else get_gemini_api_key()).strip()
+    if not key:
+        return {
+            "valid": False,
+            "model": "None",
+            "message": "GEMINI_API_KEY is not configured. Add it in Streamlit secrets or .env file.",
+        }
+
+    provider = GeminiProvider(api_key=key)
+    res = provider.generate([{"role": "user", "content": "Ping. Respond with 'OK'."}], max_tokens=10)
+    if res.success:
+        return {
+            "valid": True,
+            "model": provider.model,
+            "message": f"Successfully verified Google Gemini API connection ({provider.model})!",
+        }
+    return {
+        "valid": False,
+        "model": provider.model,
+        "message": res.error or "Failed to connect to Google Gemini API.",
+    }

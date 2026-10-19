@@ -99,6 +99,25 @@ def create_task(
 
     uid = (user_id or "user_student_default").strip()
     now = datetime.now(timezone.utc).isoformat()
+
+    # Prevent accidental duplicate task creation on rapid double-clicks or reruns
+    recent_dup_sql = """
+        SELECT id, created_at FROM tasks 
+        WHERE user_id = ? AND title = ? AND category = ? AND status = 'pending'
+        ORDER BY id DESC LIMIT 1
+    """
+    recent = fetch_one(recent_dup_sql, (uid, cleaned_title, cleaned_category), db_path=db_path)
+    if recent and recent.get("created_at"):
+        try:
+            created_dt = datetime.fromisoformat(recent["created_at"])
+            current_dt = datetime.fromisoformat(now)
+            if abs((current_dt - created_dt).total_seconds()) < 2:
+                existing_task = get_task_by_id(recent["id"], db_path=db_path)
+                if existing_task:
+                    return existing_task
+        except Exception:
+            pass
+
     sql = """
         INSERT INTO tasks (
             user_id, title, description, priority, category, due_date, due_time,

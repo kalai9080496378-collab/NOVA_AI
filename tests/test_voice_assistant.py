@@ -162,6 +162,14 @@ def test_synthesize_speech_success_with_gtts():
     assert "Google Text-to-Speech" in res["engine_used"]
 
 
+def test_synthesize_speech_with_tld_and_kwargs():
+    """Verify synthesize_speech accepts tld parameter and kwargs without TypeError."""
+    res = synthesize_speech("Speech synthesis with Indian cadence.", lang="en", tld="co.in")
+    assert res["success"] is True
+    assert res["audio_bytes"] is not None
+    assert res["format"] == "audio/mp3"
+
+
 def test_synthesize_speech_network_error_graceful_handling():
     with patch("gtts.gTTS.write_to_fp", side_effect=Exception("Simulated socket timeout")):
         res = synthesize_speech("Valid message text here.")

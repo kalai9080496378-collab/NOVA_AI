@@ -457,6 +457,8 @@ def synthesize_speech(
     lang: str = "auto",
     slow: bool = False,
     max_chars: int = 800,
+    tld: Optional[str] = None,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """
     Synthesizes natural spoken audio from text using gTTS with bilingual (Tamil & English) support.
@@ -468,17 +470,10 @@ def synthesize_speech(
         lang: Language code ('auto', 'en', 'ta', 'en-in', 'en-us').
         slow: Speak at slower speed if True.
         max_chars: Maximum characters to synthesize for safety.
+        tld: Top-level domain for regional accent/cadence (e.g. 'co.in', 'com', 'co.uk').
         
     Returns:
-        Dict containing:
-            - 'success': bool
-            - 'audio_bytes': binary MP3 audio or None
-            - 'format': 'audio/mp3' or None
-            - 'engine_used': string name of provider/engine
-            - 'cleaned_text': the spoken transcript
-            - 'language_used': 'en' or 'ta'
-            - 'error': error message if failed, else None
-            - 'error_type': error category
+        Dict containing success, audio_bytes, format, engine_used, cleaned_text, language_used, error.
     """
     if not text or not str(text).strip():
         return {
@@ -519,23 +514,33 @@ def synthesize_speech(
 
     # Auto-detect language: if Tamil script is present, synthesize in Tamil ('ta')
     target_lang = "en"
-    tld = "co.in"  # Natural Indian English cadence
     clean_lang = (lang or "auto").strip().lower()
 
     if clean_lang in ("ta", "ta-in", "tamil") or (clean_lang in ("auto", "en", "en-in", "en-us") and bool(re.search(r"[\u0B80-\u0BFF]", cleaned))):
         target_lang = "ta"
-        tld = "com"
+        chosen_tld = tld or "com"
     elif clean_lang in ("en-us", "us"):
         target_lang = "en"
-        tld = "com"
+        chosen_tld = tld or "com"
     elif clean_lang in ("en-gb", "uk"):
         target_lang = "en"
-        tld = "co.uk"
+        chosen_tld = tld or "co.uk"
+    else:
+        target_lang = "en"
+        chosen_tld = tld or "co.in"
 
     try:
-        tts = gTTS(text=cleaned, lang=target_lang, tld=tld, slow=slow)
-        buffer = io.BytesIO()
-        tts.write_to_fp(buffer)
+        try:
+            tts = gTTS(text=cleaned, lang=target_lang, tld=chosen_tld, slow=slow)
+            buffer = io.BytesIO()
+            tts.write_to_fp(buffer)
+        except Exception:
+            # Fallback to standard tld="com" and lang="en" if chosen tld or dialect failed
+            tts = gTTS(text=cleaned, lang="en", tld="com", slow=slow)
+            buffer = io.BytesIO()
+            tts.write_to_fp(buffer)
+            target_lang = "en"
+
         buffer.seek(0)
         audio_bytes = buffer.read()
 
