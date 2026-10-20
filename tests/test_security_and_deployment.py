@@ -218,3 +218,64 @@ def test_voice_consent_guardrail_enforcement():
     assert result["success"] is False
     assert result["error_type"] == "consent_required"
     assert "External audio processing is disabled" in result["error"]
+
+
+def test_streamlit_cloud_deployment_configuration():
+    """Verify essential Streamlit Cloud deployment assets exist and are properly structured."""
+    project_root = Path(__file__).resolve().parent.parent
+
+    # 1. requirements.txt
+    req_file = project_root / "requirements.txt"
+    assert req_file.exists(), "requirements.txt must exist in project root"
+    req_content = req_file.read_text(encoding="utf-8")
+    assert "google-genai" in req_content, "google-genai must be declared in requirements.txt"
+    assert "streamlit" in req_content
+    assert "SpeechRecognition" in req_content
+
+    # 2. .python-version
+    py_ver_file = project_root / ".python-version"
+    assert py_ver_file.exists(), ".python-version must exist for Streamlit Cloud runtime pinning"
+    assert py_ver_file.read_text(encoding="utf-8").strip().startswith("3.11")
+
+    # 3. packages.txt
+    pkg_file = project_root / "packages.txt"
+    assert pkg_file.exists(), "packages.txt must exist for Linux container audio/codec binaries"
+    pkg_content = pkg_file.read_text(encoding="utf-8")
+    assert "ffmpeg" in pkg_content
+    assert "flac" in pkg_content
+
+    # 4. .streamlit/config.toml
+    cfg_file = project_root / ".streamlit" / "config.toml"
+    assert cfg_file.exists(), ".streamlit/config.toml must exist"
+    cfg_content = cfg_file.read_text(encoding="utf-8")
+    assert "headless = true" in cfg_content
+
+    # 5. .gitignore protects secrets and databases
+    gi_file = project_root / ".gitignore"
+    assert gi_file.exists()
+    gi_content = gi_file.read_text(encoding="utf-8")
+    assert ".streamlit/secrets.toml" in gi_content
+    assert ".env" in gi_content
+    assert "*.db" in gi_content
+
+
+def test_secrets_resolution_streamlit_cloud(monkeypatch):
+    """Verify that Gemini and OpenAI keys resolve properly from Streamlit secrets mocks."""
+    from nova_core.config import get_gemini_api_key, get_openai_api_key, is_llm_configured
+    import streamlit as st
+
+    # Mock st.secrets with standard flat structure
+    mock_secrets = {
+        "GEMINI_API_KEY": "AIzaSy_MockStreamlitCloudSecretKey12345",
+        "OPENAI_API_KEY": "sk-proj-MockOpenAiKey12345",
+    }
+    monkeypatch.setattr(st, "secrets", mock_secrets, raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    key = get_gemini_api_key()
+    assert key == "AIzaSy_MockStreamlitCloudSecretKey12345"
+    assert get_openai_api_key() == "sk-proj-MockOpenAiKey12345"
+    assert is_llm_configured() is True
+
