@@ -334,6 +334,39 @@ NOVA features an end-to-end self-learning architecture designed specifically for
 
 ---
 
+## 🚀 Streamlit Cloud Deployment Guide
+
+NOVA is 100% pre-configured and tested for deployment on **Streamlit Community Cloud**:
+
+### 1. Push to GitHub
+Ensure all files are committed and pushed to your GitHub repository:
+```bash
+git remote add origin https://github.com/<your-username>/<your-repo-name>.git
+git branch -M main
+git push -u origin main
+```
+
+### 2. Deploy on Streamlit Community Cloud
+1. Sign in to [share.streamlit.io](https://share.streamlit.io/) with your GitHub account.
+2. Click **"New app"**.
+3. Select your repository, branch (`main`), and set **Main file path** to `app.py`.
+4. Click **"Deploy!"**. Streamlit Cloud will automatically:
+   - Pin Python **3.11.9** via [`.python-version`](file:///.python-version)
+   - Install Linux system audio packages via [`packages.txt`](file:///packages.txt) (`ffmpeg`, `flac`)
+   - Install production dependencies via [`requirements.txt`](file:///requirements.txt) (including `google-genai` and `streamlit`)
+   - Apply production headless server settings from [`.streamlit/config.toml`](file:///.streamlit/config.toml)
+
+### 3. Configure Gemini API Key in Streamlit Secrets
+In your deployed Streamlit Cloud app dashboard:
+1. Click **Settings** (bottom-right ⚙️ icon) &rarr; **Secrets**.
+2. Paste the following configuration (replace with your free key from [aistudio.google.com](https://aistudio.google.com)):
+   ```toml
+   GEMINI_API_KEY = "AIzaSyYourActualGeminiApiKeyHere"
+   ```
+3. Click **Save**. NOVA will immediately detect the key without needing a server rebuild!
+
+---
+
 ## 🔒 Safety & Privacy Principles
 
 1. **Local-First Storage**: All data (tasks, memories, documents, and chunks) resides in local SQLite database (`data/nova.db`) and local files (`data/documents/`).
