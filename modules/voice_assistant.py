@@ -529,14 +529,15 @@ def synthesize_speech(
         target_lang = "en"
         chosen_tld = tld or "co.in"
 
+    timeout_val = float(kwargs.get("timeout", 10.0))
     try:
         try:
-            tts = gTTS(text=cleaned, lang=target_lang, tld=chosen_tld, slow=slow)
+            tts = gTTS(text=cleaned, lang=target_lang, tld=chosen_tld, slow=slow, timeout=timeout_val)
             buffer = io.BytesIO()
             tts.write_to_fp(buffer)
         except Exception:
             # Fallback to standard tld="com" and lang="en" if chosen tld or dialect failed
-            tts = gTTS(text=cleaned, lang="en", tld="com", slow=slow)
+            tts = gTTS(text=cleaned, lang="en", tld="com", slow=slow, timeout=timeout_val)
             buffer = io.BytesIO()
             tts.write_to_fp(buffer)
             target_lang = "en"
