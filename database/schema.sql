@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS chat_threads (
     id TEXT PRIMARY KEY,                       -- Unique thread ID (UUID)
     user_id TEXT NOT NULL DEFAULT 'user_student_default', -- Account owner
     title TEXT NOT NULL DEFAULT 'New Chat',    -- User-visible conversation title
-    model TEXT DEFAULT 'gemini-1.5-flash',     -- Model associated with thread
+    model TEXT DEFAULT 'gemini-3.8-flash',     -- Model associated with thread
     system_prompt TEXT,                        -- Optional thread custom instructions
     is_pinned INTEGER NOT NULL DEFAULT 0,      -- 1 = pinned to top
     is_archived INTEGER NOT NULL DEFAULT 0,    -- 1 = archived (hidden from active list)
@@ -224,7 +224,7 @@ CREATE TABLE IF NOT EXISTS model_registry (
     id TEXT PRIMARY KEY,                       -- e.g., 'model_v1_base', 'model_v2_tuned'
     version_tag TEXT NOT NULL,                 -- 'v1.0.0-base', 'v1.1.0-incontext', etc.
     provider TEXT NOT NULL,                    -- 'gemini', 'openai', 'in_context_hybrid'
-    base_model TEXT NOT NULL,                  -- 'gemini-1.5-flash', 'gpt-4o-mini', 'rule_based'
+    base_model TEXT NOT NULL,                  -- 'gemini-3.8-flash', 'gpt-4o-mini', 'rule_based'
     status TEXT NOT NULL DEFAULT 'active',     -- 'active', 'evaluating', 'archived', 'rolled_back'
     is_fine_tuned INTEGER NOT NULL DEFAULT 0,  -- 0 = base/in-context, 1 = fine-tuned weight checkpoint
     eval_score REAL DEFAULT 0.0,               -- Benchmark accuracy score (0.0 to 100.0)

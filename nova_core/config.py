@@ -40,7 +40,7 @@ if not DATABASE_PATH.is_absolute():
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "none").strip().lower()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
 # Voice Intelligence Settings
@@ -51,43 +51,16 @@ VOICE_AUTO_SPEAK = os.getenv("VOICE_AUTO_SPEAK", "false").strip().lower() in ("t
 
 def get_gemini_api_key() -> str:
     """
-    Securely retrieves GEMINI_API_KEY from environment variables, .env file,
-    Streamlit Cloud secrets, or active session state. Never exposes key in logs or UI.
+    Securely retrieves GEMINI_API_KEY from Streamlit Cloud secrets,
+    active session state, environment variables, or local .env file.
+    Priority: Streamlit Secrets -> Session State -> Environment Variables -> .env.
+    Never exposes key in logs or UI.
     """
-    # 1. Check Streamlit session_state (if user entered/saved it in UI during active session)
-    try:
-        import streamlit as st
-        if hasattr(st, "session_state") and "user_gemini_api_key" in st.session_state:
-            val = str(st.session_state["user_gemini_api_key"]).strip()
-            if val and not val.startswith("your_") and val != "YOUR_GEMINI_API_KEY":
-                return val
-    except Exception:
-        pass
-
-    # 2. Check os.environ for GEMINI_API_KEY or GOOGLE_API_KEY
-    for env_var in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
-        val = os.getenv(env_var, "").strip()
-        if val and not val.startswith("your_") and val != "YOUR_GEMINI_API_KEY":
-            return val
-
-    # 3. Reload from .env if present (picks up newly added or modified keys without process restart)
-    try:
-        from dotenv import load_dotenv
-        env_file = BASE_DIR / ".env"
-        if env_file.exists():
-            load_dotenv(dotenv_path=env_file, override=True)
-            for env_var in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
-                val = os.getenv(env_var, "").strip()
-                if val and not val.startswith("your_") and val != "YOUR_GEMINI_API_KEY":
-                    return val
-    except Exception:
-        pass
-
-    # 4. Check Streamlit Cloud secrets (st.secrets)
+    # 1. Check Streamlit Cloud secrets (st.secrets)
     try:
         import streamlit as st
         if hasattr(st, "secrets") and st.secrets:
-            # Check direct keys using .get() and dict lookup
+            # Check direct keys
             for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "gemini_api_key", "google_api_key"):
                 try:
                     val = st.secrets.get(k)
@@ -107,6 +80,37 @@ def get_gemini_api_key() -> str:
                                     return str(sub_v).strip()
                 except Exception:
                     pass
+    except Exception:
+        pass
+
+    # 2. Check Streamlit session_state (if user entered/saved it in UI during active session)
+    try:
+        import streamlit as st
+        if hasattr(st, "session_state") and "user_gemini_api_key" in st.session_state:
+            val = str(st.session_state["user_gemini_api_key"]).strip()
+            if val and not val.startswith("your_") and val != "YOUR_GEMINI_API_KEY":
+                return val
+    except Exception:
+        pass
+
+    # 3. Check os.environ for GEMINI_API_KEY or GOOGLE_API_KEY
+    if "GEMINI_API_KEY" in os.environ or "GOOGLE_API_KEY" in os.environ:
+        for env_var in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+            val = os.getenv(env_var, "").strip()
+            if val and not val.startswith("your_") and val != "YOUR_GEMINI_API_KEY":
+                return val
+        return ""
+
+    # 4. Check .env if neither was defined in os.environ
+    try:
+        from dotenv import dotenv_values
+        env_file = BASE_DIR / ".env"
+        if env_file.exists():
+            vals = dotenv_values(dotenv_path=env_file)
+            for env_var in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+                val = (vals.get(env_var) or "").strip()
+                if val and not val.startswith("your_") and val != "YOUR_GEMINI_API_KEY":
+                    return val
     except Exception:
         pass
 
@@ -152,7 +156,7 @@ def get_llm_status() -> dict:
     openai_key = get_openai_api_key()
 
     if (prov == "gemini" and gemini_key) or (not openai_key and gemini_key):
-        model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
+        model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
         return {
             "status": "connected",
             "provider": "GEMINI",

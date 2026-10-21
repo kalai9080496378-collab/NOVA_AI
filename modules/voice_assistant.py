@@ -94,15 +94,16 @@ def _transcribe_with_gemini(
     api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Transcribes audio using Google Gemini 1.5 Flash multimodal understanding.
+    Transcribes audio using Google Gemini 3.8 Flash multimodal understanding via the official Google Gen AI SDK.
     Exceptional for noisy recordings, Indian English, Tamil, and Tanglish mixed speech.
     """
-    key = (api_key or os.getenv("GEMINI_API_KEY", "")).strip()
+    from nova_core.config import get_gemini_api_key
+    key = (api_key if api_key is not None else get_gemini_api_key()).strip()
     if not key:
         return {
             "success": False,
             "text": "",
-            "engine_used": "Google Gemini 1.5 Flash",
+            "engine_used": "Google Gemini 3.8 Flash",
             "error": "GEMINI_API_KEY is not configured.",
             "error_type": "missing_api_key",
         }
@@ -129,73 +130,44 @@ def _transcribe_with_gemini(
             "Output ONLY the exact transcribed text without quotes, commentary, or markdown formatting."
         )
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={key}"
-    payload = {
-        "contents": [{
-            "parts": [
-                {
-                    "inline_data": {
-                        "mime_type": "audio/wav",
-                        "data": b64_audio,
-                    }
-                },
-                {
-                    "text": prompt,
-                }
-            ]
-        }],
-        "generationConfig": {
-            "temperature": 0.0,
-            "maxOutputTokens": 350,
-        }
-    }
-
+    # 1. Primary: Official Google Gen AI Python SDK via Interactions API
     try:
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
+        from google import genai
+        client = genai.Client(api_key=key)
+        interaction = client.interactions.create(
+            model="gemini-3.8-flash",
+            input=[
+                {"type": "text", "text": prompt},
+                {"type": "audio", "data": b64_audio, "mime_type": "audio/wav"},
+            ],
         )
-        with urllib.request.urlopen(req, timeout=12.0) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            candidates = data.get("candidates", [])
-            if candidates:
-                parts = candidates[0].get("content", {}).get("parts", [])
-                if parts:
-                    text_out = parts[0].get("text", "").strip()
-                    text_out = re.sub(r'^["\']|["\']$', '', text_out).strip()
-                    if text_out:
-                        return {
-                            "success": True,
-                            "text": text_out,
-                            "engine_used": "Google Gemini 1.5 Flash (Multimodal Audio)",
-                            "error": None,
-                            "error_type": None,
-                        }
+        text_out = (interaction.output_text or "").strip()
+        text_out = re.sub(r'^["\']|["\']$', '', text_out).strip()
+        if text_out:
             return {
-                "success": False,
-                "text": "",
-                "engine_used": "Google Gemini 1.5 Flash",
-                "error": "Gemini returned an empty transcription for this recording.",
-                "error_type": "no_speech_detected",
+                "success": True,
+                "text": text_out,
+                "engine_used": "Google Gemini 3.8 Flash (Multimodal Audio)",
+                "error": None,
+                "error_type": None,
             }
-    except urllib.error.HTTPError as he:
-        err_msg = he.read().decode("utf-8") if he.fp else str(he)
         return {
             "success": False,
             "text": "",
-            "engine_used": "Google Gemini 1.5 Flash",
-            "error": f"Gemini API error ({he.code}): {err_msg[:200]}",
-            "error_type": "api_error",
+            "engine_used": "Google Gemini 3.8 Flash",
+            "error": "Gemini returned an empty transcription for this recording.",
+            "error_type": "no_speech_detected",
         }
     except Exception as e:
+        err_msg = str(e)
+        if key in err_msg:
+            err_msg = err_msg.replace(key, "[REDACTED_API_KEY]")
         return {
             "success": False,
             "text": "",
-            "engine_used": "Google Gemini 1.5 Flash",
-            "error": f"Gemini audio processing error: {str(e)}",
-            "error_type": "network_error",
+            "engine_used": "Google Gemini 3.8 Flash",
+            "error": f"Gemini audio processing error: {err_msg[:200]}",
+            "error_type": "api_error",
         }
 
 
@@ -296,7 +268,7 @@ def transcribe_audio(
     
     Engines:
     - 'google': Google Web Speech API (Always Free, zero API key required)
-    - 'gemini': Google Gemini 1.5 Flash Multimodal Audio (Uses GEMINI_API_KEY)
+    - 'gemini': Google Gemini 3.8 Flash Multimodal Audio (Uses GEMINI_API_KEY)
     - 'auto': Intelligently selects Gemini if key configured, otherwise Google Web Speech
     
     Args:
@@ -346,9 +318,11 @@ def transcribe_audio(
     # 4. Engine: Google Gemini Multimodal Audio (if explicitly selected or auto with key)
     use_gemini = False
     clean_engine = (engine or "google").strip().lower()
+    from nova_core.config import get_gemini_api_key
+    gemini_key_available = bool(get_gemini_api_key())
     if clean_engine == "gemini":
         use_gemini = True
-    elif clean_engine == "auto" and os.getenv("GEMINI_API_KEY", "").strip():
+    elif clean_engine == "auto" and gemini_key_available:
         use_gemini = True
 
     if use_gemini:
@@ -574,12 +548,13 @@ def get_voice_capabilities() -> Dict[str, Any]:
     Returns diagnostic and privacy metadata regarding voice hardware,
     libraries, supported STT/TTS engines, bilingual support, and consent requirements.
     """
-    has_gemini = bool(os.getenv("GEMINI_API_KEY", "").strip())
+    from nova_core.config import get_gemini_api_key
+    has_gemini = bool(get_gemini_api_key())
     return {
         "stt": {
             "available": HAVE_SPEECH_RECOGNITION,
             "default_engine": "Google Web Speech API",
-            "supported_engines": ["Google Web Speech API", "Google Gemini 1.5 Flash (Multimodal Audio)"] if has_gemini else ["Google Web Speech API"],
+            "supported_engines": ["Google Web Speech API", "Google Gemini 3.8 Flash (Multimodal Audio)"] if has_gemini else ["Google Web Speech API"],
             "supported_languages": SUPPORTED_LANGUAGES,
             "cost": "$0.00 (Free, no API key required for Google Web Speech)",
             "privacy_model": (

@@ -17,7 +17,7 @@ from database.db import execute_insert, execute_query, fetch_all, fetch_one, log
 
 def create_thread(
     title: str = "New Chat",
-    model: str = "gemini-1.5-flash",
+    model: str = "gemini-3.8-flash",
     thread_id: Optional[str] = None,
     system_prompt: Optional[str] = None,
     user_id: str = "user_student_default",

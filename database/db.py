@@ -166,7 +166,7 @@ def init_db(db_path: Optional[Path | str] = None) -> bool:
                         INSERT OR IGNORE INTO model_registry (
                             id, version_tag, provider, base_model, status, is_fine_tuned, eval_score, eval_details, training_cost_usd, created_at, updated_at
                         ) VALUES (
-                            'model_v1_base', 'v1.0.0-base', 'gemini', 'gemini-1.5-flash', 'active', 0, 85.0,
+                            'model_v1_base', 'v1.0.0-base', 'gemini', 'gemini-3.8-flash', 'active', 0, 85.0,
                             '{"accuracy": 85.0, "instruction_following": 88.0, "format_compliance": 92.0, "safety": 99.0}',
                             0.0, ?, ?
                         )
