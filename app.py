@@ -2920,14 +2920,14 @@ elif selected_page == "⚙️ Settings":
 
             current_engine = st.session_state.get("voice_engine", "auto")
             eng_options = [
-                "Auto (Gemini 1.5 Flash if available, else Google Web Speech)",
+                "Auto (Gemini 3.8 Flash if available, else Google Web Speech)",
                 "Google Web Speech ($0.00 / Free)",
-                "Google Gemini 1.5 Flash (Multimodal Audio)",
+                "Google Gemini 3.8 Flash (Multimodal Audio)",
             ]
             eng_map = {
-                "Auto (Gemini 1.5 Flash if available, else Google Web Speech)": "auto",
+                "Auto (Gemini 3.8 Flash if available, else Google Web Speech)": "auto",
                 "Google Web Speech ($0.00 / Free)": "google",
-                "Google Gemini 1.5 Flash (Multimodal Audio)": "gemini",
+                "Google Gemini 3.8 Flash (Multimodal Audio)": "gemini",
             }
             code_to_eng_idx = {"auto": 0, "google": 1, "gemini": 2}
             sel_eng_label = st.selectbox(
@@ -2997,7 +2997,7 @@ elif selected_page == "⚙️ Settings":
         st.markdown("#### 🔑 Gemini API Key Configuration")
         active_key = get_gemini_api_key()
         if active_key:
-            st.success(f"✅ **Gemini API Key Active**: `{_mask_key(active_key)}` — Connected to `{llm_stat.get('model', 'gemini-1.5-flash')}`")
+            st.success(f"✅ **Gemini API Key Active**: `{_mask_key(active_key)}` — Connected to `{llm_stat.get('model', 'gemini-3.8-flash')}`")
         else:
             st.warning("🟠 **Gemini API Key Not Configured**: Enter your key below or add `GEMINI_API_KEY` to your `.env` file or Streamlit Cloud Secrets.")
 
@@ -3061,7 +3061,7 @@ elif selected_page == "⚙️ Settings":
               Create or edit `.env` in the project root:
               ```env
               GEMINI_API_KEY=AIzaSy...
-              GEMINI_MODEL=gemini-1.5-flash
+              GEMINI_MODEL=gemini-3.8-flash
               LLM_PROVIDER=gemini
               ```
             - **Streamlit Community Cloud (`secrets.toml`):**

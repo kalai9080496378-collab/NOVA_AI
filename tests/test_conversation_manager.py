@@ -43,12 +43,12 @@ def test_create_and_get_thread(temp_db):
     """Verify thread creation with metadata and default properties."""
     thread = create_thread(
         title="Deep Learning Study Plan",
-        model="gemini-1.5-flash",
+        model="gemini-3.8-flash",
         db_path=temp_db,
     )
     assert thread["id"].startswith("thread_")
     assert thread["title"] == "Deep Learning Study Plan"
-    assert thread["model"] == "gemini-1.5-flash"
+    assert thread["model"] == "gemini-3.8-flash"
     assert thread["is_pinned"] == 0
     assert thread["is_archived"] == 0
 
