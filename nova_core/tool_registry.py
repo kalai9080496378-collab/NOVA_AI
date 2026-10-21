@@ -5,6 +5,7 @@ and auditable execution. Never executes arbitrary shell/code.
 """
 
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 import inspect
 
@@ -68,7 +69,8 @@ class ToolDefinition:
 class ToolRegistry:
     """Central registry and execution engine for NOVA tools."""
 
-    def __init__(self):
+    def __init__(self, db_path: Optional[Path | str] = None):
+        self.db_path = db_path
         self._tools: Dict[str, ToolDefinition] = {}
         self._register_default_tools()
 
@@ -109,13 +111,17 @@ class ToolRegistry:
         tool_name: str,
         arguments: Dict[str, Any],
         user_confirmed: bool = False,
+        user_id: Optional[str] = None,
+        db_path: Optional[Path | str] = None,
     ) -> ToolResult:
         """
-        Validates arguments and executes the tool safely.
+        Validates arguments and executes the tool safely, enforcing user isolation
+        and target database routing.
         """
+        effective_db = db_path or self.db_path
         tool = self.get_tool(tool_name)
         if not tool:
-            log_action("tool_call", f"Requested unknown tool: '{tool_name}'", status="failed")
+            log_action("tool_call", f"Requested unknown tool: '{tool_name}'", status="failed", db_path=effective_db)
             return ToolResult(
                 status="failed",
                 message=f"Tool '{tool_name}' is not recognized by NOVA.",
@@ -124,7 +130,7 @@ class ToolRegistry:
 
         # Destructive confirmation check
         if tool.requires_confirmation and not user_confirmed:
-            log_action("tool_call", f"Action '{tool_name}' requires confirmation", status="proposed")
+            log_action("tool_call", f"Action '{tool_name}' requires confirmation", status="proposed", db_path=effective_db)
             return ToolResult(
                 status="awaiting_confirmation",
                 message=f"Action '{tool_name}' requires explicit user confirmation before proceeding.",
@@ -141,7 +147,7 @@ class ToolRegistry:
 
             if param_name not in arguments or arguments[param_name] is None:
                 if is_required:
-                    log_action(tool_name, f"Missing required parameter '{param_name}'", status="failed")
+                    log_action(tool_name, f"Missing required parameter '{param_name}'", status="failed", db_path=effective_db)
                     return ToolResult(
                         status="failed",
                         message=f"Parameter '{param_name}' is required for tool '{tool_name}'.",
@@ -167,10 +173,17 @@ class ToolRegistry:
                 else:
                     validated_args[param_name] = raw_val
 
+        # Forward user_id and db_path if handler supports them
+        sig = inspect.signature(tool.handler)
+        if "user_id" in sig.parameters and user_id is not None:
+            validated_args["user_id"] = user_id
+        if "db_path" in sig.parameters:
+            validated_args["db_path"] = effective_db
+
         # Execute handler with validated arguments
         try:
             result_data = tool.handler(**validated_args)
-            log_action(tool_name, f"Successfully executed tool '{tool_name}'", status="success")
+            log_action(tool_name, f"Successfully executed tool '{tool_name}'", status="success", db_path=effective_db)
             return ToolResult(
                 status="success",
                 message=f"Successfully executed '{tool_name}'.",
@@ -178,7 +191,7 @@ class ToolRegistry:
                 tool_name=tool_name,
             )
         except Exception as e:
-            log_action(tool_name, f"Execution failed: {str(e)}", status="failed")
+            log_action(tool_name, f"Execution failed: {str(e)}", status="failed", db_path=effective_db)
             return ToolResult(
                 status="failed",
                 message=f"Execution error in '{tool_name}': {str(e)}",
@@ -261,23 +274,79 @@ class ToolRegistry:
         )
 
     # Tool Handlers Implementation
-    def _tool_create_task(self, title: str, description: str = "", priority: str = "Medium", due_date: Optional[str] = None):
-        return create_task(title=title, description=description, priority=priority, due_date=due_date)
+    def _tool_create_task(
+        self,
+        title: str,
+        description: str = "",
+        priority: str = "Medium",
+        due_date: Optional[str] = None,
+        user_id: Optional[str] = None,
+        db_path: Optional[Path | str] = None,
+    ):
+        effective_db = db_path or self.db_path
+        return create_task(
+            title=title,
+            description=description,
+            priority=priority,
+            due_date=due_date,
+            user_id=user_id,
+            db_path=effective_db,
+        )
 
-    def _tool_list_tasks(self, status: Optional[str] = "pending", priority: Optional[str] = None):
-        return get_tasks(status=status, priority=priority)
+    def _tool_list_tasks(
+        self,
+        status: Optional[str] = "pending",
+        priority: Optional[str] = None,
+        user_id: Optional[str] = None,
+        db_path: Optional[Path | str] = None,
+    ):
+        effective_db = db_path or self.db_path
+        return get_tasks(
+            status=status,
+            priority=priority,
+            user_id=user_id,
+            db_path=effective_db,
+        )
 
-    def _tool_complete_task(self, task_id: int):
-        ok = complete_task(task_id)
+    def _tool_complete_task(
+        self,
+        task_id: int,
+        user_id: Optional[str] = None,
+        db_path: Optional[Path | str] = None,
+    ):
+        effective_db = db_path or self.db_path
+        ok = complete_task(task_id, user_id=user_id, db_path=effective_db)
         if not ok:
             raise ValueError(f"Task #{task_id} not found or could not be completed.")
         return {"task_id": task_id, "status": "completed"}
 
-    def _tool_save_memory(self, content: str, category: str = "General"):
-        return save_memory(content=content, category=category)
+    def _tool_save_memory(
+        self,
+        content: str,
+        category: str = "General",
+        user_id: Optional[str] = None,
+        db_path: Optional[Path | str] = None,
+    ):
+        effective_db = db_path or self.db_path
+        return save_memory(
+            content=content,
+            category=category,
+            user_id=user_id,
+            db_path=effective_db,
+        )
 
-    def _tool_search_memory(self, query: str):
-        return search_memories(query=query)
+    def _tool_search_memory(
+        self,
+        query: str,
+        user_id: Optional[str] = None,
+        db_path: Optional[Path | str] = None,
+    ):
+        effective_db = db_path or self.db_path
+        return search_memories(
+            query=query,
+            user_id=user_id,
+            db_path=effective_db,
+        )
 
     def _tool_get_current_time(self):
         now = datetime.now()
@@ -287,8 +356,13 @@ class ToolRegistry:
             "iso": now.isoformat(),
         }
 
-    def _tool_analyze_productivity(self):
-        return get_task_statistics()
+    def _tool_analyze_productivity(
+        self,
+        user_id: Optional[str] = None,
+        db_path: Optional[Path | str] = None,
+    ):
+        effective_db = db_path or self.db_path
+        return get_task_statistics(user_id=user_id, db_path=effective_db)
 
 
 # Singleton instance of registry for application use

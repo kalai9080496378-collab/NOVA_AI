@@ -15,6 +15,7 @@ def isolate_test_database(tmp_path: Path, monkeypatch):
     """
     test_db = tmp_path / "test_session_nova.db"
     init_db(test_db)
+    monkeypatch.setenv("DATABASE_PATH", str(test_db))
     monkeypatch.setattr("database.db.DATABASE_PATH", test_db)
     monkeypatch.setattr("nova_core.config.DATABASE_PATH", test_db)
     yield test_db
