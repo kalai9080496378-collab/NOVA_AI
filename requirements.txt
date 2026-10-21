@@ -1,15 +1,31 @@
 # NOVA - Next-generation Organized Virtual Assistant
-# Core Dependencies for Phase 1 MVP
+# Production Dependencies for Streamlit Cloud & Local Environments
 
-streamlit>=1.30.0
+# Streamlit Core Framework
+streamlit>=1.35.0
+
+# Scientific Computing & Analytics
 pandas>=2.0.0
 numpy>=1.24.0
 matplotlib>=3.7.0
-python-dotenv>=1.0.0
-pytest>=7.0.0
-pypdf>=3.0.0
-requests>=2.31.0
 scikit-learn>=1.3.0
+
+# LLM Providers & AI SDKs
+google-genai>=1.0.0
+requests>=2.31.0
+
+# Document & Web Content Processing
+pypdf>=3.0.0
+beautifulsoup4>=4.12.0
+
+# Voice Intelligence (Speech-to-Text & Text-to-Speech)
 SpeechRecognition>=3.10.0
 gTTS>=2.5.0
-beautifulsoup4>=4.12.0
+
+# Python 3.13 standard library compatibility shims (for aifc / audioop)
+audioop-lts>=0.2.0; python_version >= "3.13"
+standard-aifc>=3.13.0; python_version >= "3.13"
+
+# Environment Variables & Testing
+python-dotenv>=1.0.0
+pytest>=7.0.0
