@@ -100,7 +100,7 @@ def test_gemini_generate_success(mock_post):
     }
     mock_post.return_value = mock_response
 
-    provider = GeminiProvider(api_key="AIzaSy_fake_test_key", model="gemini-1.5-flash")
+    provider = GeminiProvider(api_key="AIzaSy_fake_test_key", model="gemini-2.5-flash")
     res = provider.generate(
         messages=[{"role": "user", "content": "What is ML?"}],
         system_prompt="You are NOVA.",
@@ -109,7 +109,7 @@ def test_gemini_generate_success(mock_post):
     assert res.success is True
     assert "Machine Learning is a subset" in res.content
     assert res.provider == "gemini"
-    assert res.model == "gemini-1.5-flash"
+    assert res.model == "gemini-2.5-flash"
     assert res.tokens_used == 42
 
     # Verify API key was passed in HTTP header (x-goog-api-key) for security

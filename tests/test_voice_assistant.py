@@ -8,8 +8,10 @@ import io
 import struct
 import wave
 from unittest.mock import MagicMock, patch
+from pathlib import Path
 import pytest
 
+from database.db import init_db
 from modules.voice_assistant import (
     clean_text_for_speech,
     transcribe_audio,
@@ -314,8 +316,11 @@ def test_unified_voice_to_chat_pipeline():
         assert tts_res["audio_bytes"] is not None
 
 
-def test_unified_voice_transcription_editing_workflow():
+def test_unified_voice_transcription_editing_workflow(tmp_path: Path):
     """Verifies user edit flow: recognized speech is modified by user before being sent to AI."""
+    test_voice_db = tmp_path / "voice_workflow_test.db"
+    init_db(test_voice_db)
+
     wav_bytes = _generate_synthetic_wav_bytes(0.8)
     with patch("speech_recognition.Recognizer.recognize_google", return_value="add taks study machine learning"):
         stt_res = transcribe_audio(wav_bytes, consent_external=True)
@@ -326,8 +331,8 @@ def test_unified_voice_transcription_editing_workflow():
     user_edited_prompt = raw_transcription.replace("taks", "task")
     assert user_edited_prompt == "add task study machine learning"
 
-    assistant = NovaAssistant()
-    stream = assistant.process_message_stream(user_edited_prompt)
+    assistant = NovaAssistant(db_path=test_voice_db)
+    stream = assistant.process_message_stream(user_edited_prompt, user_id="test_voice_user")
     response = "".join(list(stream))
     assert "study machine learning" in response.lower() or "created" in response.lower() or "task" in response.lower()
 

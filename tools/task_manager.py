@@ -100,7 +100,7 @@ def create_task(
     uid = (user_id or "user_student_default").strip()
     now = datetime.now(timezone.utc).isoformat()
 
-    # Prevent accidental duplicate task creation on rapid double-clicks or reruns
+    # Prevent accidental duplicate task creation on rapid double-clicks or reruns (5-second window)
     recent_dup_sql = """
         SELECT id, created_at FROM tasks 
         WHERE user_id = ? AND title = ? AND category = ? AND status = 'pending'
@@ -111,7 +111,7 @@ def create_task(
         try:
             created_dt = datetime.fromisoformat(recent["created_at"])
             current_dt = datetime.fromisoformat(now)
-            if abs((current_dt - created_dt).total_seconds()) < 2:
+            if abs((current_dt - created_dt).total_seconds()) < 5:
                 existing_task = get_task_by_id(recent["id"], db_path=db_path)
                 if existing_task:
                     return existing_task
@@ -319,12 +319,17 @@ def update_task(
     return True
 
 
-def complete_task(task_id: int, db_path: Optional[Path | str] = None) -> bool:
-    """Marks a task as completed with completed_at timestamp and logs activity."""
+def complete_task(
+    task_id: int,
+    user_id: Optional[str] = None,
+    db_path: Optional[Path | str] = None,
+) -> bool:
+    """Marks a task as completed with completed_at timestamp and logs activity under user_id."""
     task = get_task_by_id(task_id, db_path=db_path)
     if not task:
         return False
 
+    task_uid = user_id or task.get("user_id") or "user_student_default"
     now = datetime.now(timezone.utc).isoformat()
     sql = "UPDATE tasks SET status = 'completed', completed_at = ? WHERE id = ?"
     affected = execute_query(sql, (now, task_id), db_path=db_path)
@@ -333,19 +338,23 @@ def complete_task(task_id: int, db_path: Optional[Path | str] = None) -> bool:
         log_action("complete_task", f"Completed task #{task_id}: '{task['title']}'", status="success", db_path=db_path)
 
         act_sql = """
-            INSERT INTO activity_records (activity_type, duration, metadata, created_at)
-            VALUES ('task_completed', ?, ?, ?)
+            INSERT INTO activity_records (user_id, activity_type, duration, metadata, created_at)
+            VALUES (?, 'task_completed', ?, ?, ?)
         """
         try:
             dur = float(task.get("estimated_duration") or 60.0)
-            execute_insert(act_sql, (dur, f"Task #{task_id}: {task['title']}", now), db_path=db_path)
+            execute_insert(act_sql, (task_uid, dur, f"Task #{task_id}: {task['title']}", now), db_path=db_path)
         except Exception as e:
             print(f"[Warning] Failed to log activity: {e}")
         return True
     return False
 
 
-def reopen_task(task_id: int, db_path: Optional[Path | str] = None) -> bool:
+def reopen_task(
+    task_id: int,
+    user_id: Optional[str] = None,
+    db_path: Optional[Path | str] = None,
+) -> bool:
     """Reopens a completed task back to pending."""
     task = get_task_by_id(task_id, db_path=db_path)
     if not task:
@@ -359,7 +368,11 @@ def reopen_task(task_id: int, db_path: Optional[Path | str] = None) -> bool:
     return False
 
 
-def delete_task(task_id: int, db_path: Optional[Path | str] = None) -> bool:
+def delete_task(
+    task_id: int,
+    user_id: Optional[str] = None,
+    db_path: Optional[Path | str] = None,
+) -> bool:
     """Permanently deletes a task from the database."""
     task = get_task_by_id(task_id, db_path=db_path)
     if not task:

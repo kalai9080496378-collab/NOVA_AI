@@ -5,6 +5,7 @@ and conversational response generation.
 """
 
 import logging
+from pathlib import Path
 import re
 import uuid
 from datetime import datetime, timezone
@@ -32,8 +33,17 @@ class NovaAssistant:
     Input Validation -> Intent & Tool Selection -> Safety Checks -> Validated Execution -> Response.
     """
 
-    def __init__(self, tool_registry: Optional[ToolRegistry] = None):
-        self.registry = tool_registry or default_tool_registry
+    def __init__(
+        self,
+        tool_registry: Optional[ToolRegistry] = None,
+        db_path: Optional[Path | str] = None,
+    ):
+        if db_path:
+            self.db_path = Path(db_path)
+        else:
+            from database.db import DATABASE_PATH
+            self.db_path = DATABASE_PATH
+        self.registry = tool_registry or ToolRegistry(db_path=self.db_path)
 
     def process_message(
         self,
@@ -75,7 +85,7 @@ class NovaAssistant:
 
         # 2. Check if input is a deterministic tool command
         if self._is_explicit_tool_command(cleaned_input):
-            output = self._handle_rule_based_flow(cleaned_input, conv_id)
+            output = self._handle_rule_based_flow(cleaned_input, conv_id, user_id=user_id)
         # 3. Check Deep Research Mode
         elif deep_research or is_deep_research_mode(cleaned_input):
             def llm_gen(msgs, sys_p):
@@ -148,13 +158,13 @@ class NovaAssistant:
                     if is_llm_configured():
                         output = self._handle_llm_flow(cleaned_input, conv_id, user_id=user_id)
                     else:
-                        output = self._handle_rule_based_flow(cleaned_input, conv_id)
+                        output = self._handle_rule_based_flow(cleaned_input, conv_id, user_id=user_id)
             elif is_llm_configured():
                 # Direct LLM Generative Dialogue (No external search needed)
                 output = self._handle_llm_flow(cleaned_input, conv_id, user_id=user_id)
             else:
                 # Rule-Based / Setup Guidance
-                output = self._handle_rule_based_flow(cleaned_input, conv_id)
+                output = self._handle_rule_based_flow(cleaned_input, conv_id, user_id=user_id)
 
         # Persist assistant turn with metadata and user_id
         meta = {
@@ -195,7 +205,7 @@ class NovaAssistant:
         self._save_conversation_turn(conv_id, "user", cleaned_input, user_id=user_id)
 
         if self._is_explicit_tool_command(cleaned_input):
-            output = self._handle_rule_based_flow(cleaned_input, conv_id)
+            output = self._handle_rule_based_flow(cleaned_input, conv_id, user_id=user_id)
             meta = {
                 "mode": output.get("mode"),
                 "provider": output.get("provider"),
@@ -283,7 +293,7 @@ class NovaAssistant:
                 )
                 return
 
-            output = self._handle_rule_based_flow(cleaned_input, conv_id)
+            output = self._handle_rule_based_flow(cleaned_input, conv_id, user_id=user_id)
             meta = {
                 "mode": output.get("mode"),
                 "provider": output.get("provider"),
@@ -299,7 +309,7 @@ class NovaAssistant:
 
         llm = get_llm_service()
         if not llm:
-            output = self._handle_rule_based_flow(cleaned_input, conv_id)
+            output = self._handle_rule_based_flow(cleaned_input, conv_id, user_id=user_id)
             self._save_conversation_turn(conv_id, "assistant", output["response"], metadata={"mode": "rule_based"}, user_id=user_id)
             for w in output["response"].split(" "):
                 yield w + " "
@@ -327,7 +337,7 @@ class NovaAssistant:
         corrections_context = ""
         try:
             from nova_core.learning_system import retrieve_relevant_corrections
-            matched_corrs = retrieve_relevant_corrections(cleaned_input, threshold=0.35, limit=2)
+            matched_corrs = retrieve_relevant_corrections(cleaned_input, threshold=0.35, limit=2, db_path=self.db_path)
             if matched_corrs:
                 c_items = [
                     f"- When asked: \"{mc['user_prompt']}\"\n  Approved Answer: \"{mc['corrected_response']}\""
@@ -375,17 +385,23 @@ class NovaAssistant:
         }
         self._save_conversation_turn(conv_id, "assistant", full_response, metadata=meta, user_id=user_id)
 
-    def _handle_rule_based_flow(self, user_input: str, conv_id: str) -> Dict[str, Any]:
+    def _handle_rule_based_flow(
+        self,
+        user_input: str,
+        conv_id: str,
+        user_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Rule-based intent classifier and local tool invoker.
-        Translates natural language command patterns into validated tool executions.
+        Translates natural language command patterns into validated tool executions,
+        strictly respecting user isolation and database routing.
         """
         lower = user_input.lower().strip()
 
         # Check learned user corrections first
         try:
             from nova_core.learning_system import retrieve_relevant_corrections
-            exact_corrections = retrieve_relevant_corrections(user_input, threshold=0.85, limit=1)
+            exact_corrections = retrieve_relevant_corrections(user_input, threshold=0.85, limit=1, db_path=self.db_path)
             if exact_corrections:
                 matched_corr = exact_corrections[0]
                 reply = f"💡 *(Applied verified user correction)*\n\n{matched_corr['corrected_response']}"
@@ -413,7 +429,9 @@ class NovaAssistant:
             
             tool_res = self.registry.execute(
                 "create_task",
-                {"title": title, "priority": priority, "due_date": due_date}
+                {"title": title, "priority": priority, "due_date": due_date},
+                user_id=user_id,
+                db_path=self.db_path,
             )
             
             if tool_res.status == "success":
@@ -441,7 +459,12 @@ class NovaAssistant:
         # Intent: List Tasks
         # Patterns: "list tasks", "show tasks", "my tasks", "pending tasks", "tasks"
         if lower in {"list tasks", "show tasks", "my tasks", "pending tasks", "tasks", "view tasks"}:
-            tool_res = self.registry.execute("list_tasks", {"status": "pending"})
+            tool_res = self.registry.execute(
+                "list_tasks",
+                {"status": "pending"},
+                user_id=user_id,
+                db_path=self.db_path,
+            )
             if tool_res.status == "success":
                 tasks = tool_res.data
                 if not tasks:
@@ -469,7 +492,12 @@ class NovaAssistant:
         complete_match = re.match(r"^(?:complete(?:\s+task)?|finish(?:\s+task)?|done)\s+(\d+)$", lower)
         if complete_match:
             task_id = int(complete_match.group(1))
-            tool_res = self.registry.execute("complete_task", {"task_id": task_id})
+            tool_res = self.registry.execute(
+                "complete_task",
+                {"task_id": task_id},
+                user_id=user_id,
+                db_path=self.db_path,
+            )
             if tool_res.status == "success":
                 reply = f"🎉 **Task #{task_id} marked as completed!** Activity recorded in your productivity log."
             else:
@@ -495,7 +523,12 @@ class NovaAssistant:
                 category = cat_match.group(1).strip()
                 content = cat_match.group(2).strip()
 
-            tool_res = self.registry.execute("save_memory", {"content": content, "category": category})
+            tool_res = self.registry.execute(
+                "save_memory",
+                {"content": content, "category": category},
+                user_id=user_id,
+                db_path=self.db_path,
+            )
             if tool_res.status == "success":
                 m = tool_res.data
                 reply = (
@@ -521,7 +554,12 @@ class NovaAssistant:
         recall_match = re.match(r"^(?:recall|search\s+memory(?:\s+for)?|what\s+do\s+you\s+remember(?:\s+about)?)[:\s]+(.+)$", user_input, re.IGNORECASE)
         if recall_match:
             query = recall_match.group(1).strip()
-            tool_res = self.registry.execute("search_memory", {"query": query})
+            tool_res = self.registry.execute(
+                "search_memory",
+                {"query": query},
+                user_id=user_id,
+                db_path=self.db_path,
+            )
             if tool_res.status == "success":
                 memories = tool_res.data
                 if not memories:
@@ -541,7 +579,7 @@ class NovaAssistant:
             }
 
         if lower in {"my memory", "show memories", "list memories", "memories"}:
-            all_m = get_all_memories()
+            all_m = get_all_memories(user_id=user_id, db_path=self.db_path)
             if not all_m:
                 reply = "🧠 You haven't saved any memories yet. Tell me `remember: [info]` to store something!"
             else:
@@ -570,7 +608,12 @@ class NovaAssistant:
 
         # Intent: Productivity Stats
         if lower in {"stats", "productivity", "analytics", "status", "summary"}:
-            tool_res = self.registry.execute("analyze_productivity", {})
+            tool_res = self.registry.execute(
+                "analyze_productivity",
+                {},
+                user_id=user_id,
+                db_path=self.db_path,
+            )
             stats = tool_res.data
             reply = (
                 f"📊 **Current Productivity Snapshot:**\n\n"
@@ -741,7 +784,7 @@ class NovaAssistant:
         corrections_context = ""
         try:
             from nova_core.learning_system import retrieve_relevant_corrections
-            matched_corrs = retrieve_relevant_corrections(user_input, threshold=0.35, limit=2)
+            matched_corrs = retrieve_relevant_corrections(user_input, threshold=0.35, limit=2, db_path=self.db_path)
             if matched_corrs:
                 c_items = [
                     f"- When asked: \"{mc['user_prompt']}\"\n  Approved Answer: \"{mc['corrected_response']}\""

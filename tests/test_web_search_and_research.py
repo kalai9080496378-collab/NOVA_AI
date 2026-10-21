@@ -16,6 +16,7 @@ Tests verify:
 """
 
 import os
+from pathlib import Path
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -76,7 +77,26 @@ class TestWebSearchAndRouting(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        init_db()
+        import tempfile
+        import database.db as db_mod
+        cls._tmp_dir = tempfile.TemporaryDirectory()
+        cls.test_db = Path(cls._tmp_dir.name) / "test_research.db"
+        init_db(cls.test_db)
+        cls._orig_env = os.environ.get("DATABASE_PATH")
+        cls._orig_db_path = getattr(db_mod, "DATABASE_PATH", None)
+        os.environ["DATABASE_PATH"] = str(cls.test_db)
+        db_mod.DATABASE_PATH = cls.test_db
+
+    @classmethod
+    def tearDownClass(cls):
+        import database.db as db_mod
+        if cls._orig_env is not None:
+            os.environ["DATABASE_PATH"] = cls._orig_env
+        else:
+            os.environ.pop("DATABASE_PATH", None)
+        if cls._orig_db_path is not None:
+            db_mod.DATABASE_PATH = cls._orig_db_path
+        cls._tmp_dir.cleanup()
 
     def test_routing_evergreen_math_and_concepts_no_search(self):
         """Mathematical operations, programming logic, and evergreen concepts must NOT trigger web search."""
